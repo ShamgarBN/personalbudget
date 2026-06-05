@@ -1,0 +1,24 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+}
+
+html {
+  /* Shrink the root from 16px → 14px so every text-* utility scales
+     down a couple of points without changing per-element class names. */
+  font-size: 14px;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  font-family: theme(fontFamily.sans);
+  -webkit-font-smoothing: antialiased;
+  background: #ffffff;
+  color: #111827;
+}
