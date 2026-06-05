@@ -1,0 +1,27 @@
+# Node / Vite
+node_modules
+dist
+dist-ssr
+*.local
+.vite/
+*.tsbuildinfo
+
+# Rust / Tauri (Cargo.lock IS committed — this is a binary crate)
+src-tauri/target
+
+# Build artifacts deposited at the project root (see CLAUDE.md global note)
+*.dmg
+*.app
+
+# OS / editor
+.DS_Store
+.idea
+.vscode
+*.swp
+*.swo
+
+# Local Claude Code per-machine settings
+.claude/
+
+# Sample data containing real financial info — keep local only
+sample-data/
