@@ -75,9 +75,23 @@ family-budget/
 
 ## Install
 
-Grab the latest `.dmg` from [Releases](https://github.com/ShamgarBN/personalbudget/releases) and drag `Family Budget.app` to `/Applications`.
+Grab the latest `.dmg` from [Releases](https://github.com/ShamgarBN/personalbudget/releases) — Apple Silicon only.
 
-The app is adhoc-signed (not Apple-notarized). On first launch macOS may block it — right-click the app → Open → confirm. After that it launches normally.
+The app is **adhoc-signed** (not Apple-notarized). When the DMG arrives via browser download, macOS attaches a quarantine flag to it, and Gatekeeper refuses to launch with a misleading "app is damaged" message. The fix is one Terminal command. After downloading the DMG:
+
+```bash
+open ~/Downloads/Family\ Budget_*.dmg
+
+# Copy and strip the quarantine attribute — the xattr line is the load-bearing one
+rm -rf "/Applications/Family Budget.app"
+cp -R "/Volumes/Family Budget/Family Budget.app" /Applications/
+xattr -dr com.apple.quarantine "/Applications/Family Budget.app"
+
+# Eject
+hdiutil detach "/Volumes/Family Budget"
+```
+
+After that, double-click `Family Budget.app` in `/Applications` and it'll launch normally. Repeat the same recipe for every future release.
 
 The SQLite database lives at `~/Library/Application Support/com.niemann.familybudget/budget.sqlite3`. Use the Settings → Backups section to snapshot it; backups are stored alongside the DB.
 
