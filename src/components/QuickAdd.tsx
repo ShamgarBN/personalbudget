@@ -114,7 +114,7 @@ export default function QuickAdd({
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex justify-between items-center pb-1">
-          <h2 className="text-sm font-semibold">Quick add</h2>
+          <h2 className="text-sm font-semibold">Quick Add</h2>
           <kbd className="text-[10px] text-gray-400">Enter to save · ⌘Enter to save & repeat · Esc to close</kbd>
         </div>
         <form

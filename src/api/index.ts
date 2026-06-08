@@ -71,6 +71,8 @@ export const api = {
     parentId?: number | null;
     color?: string;
     archived?: boolean;
+    isBudgeted?: boolean;
+    budgetBasis?: "monthly" | "per_pay_period";
   }) => invoke<void>("update_category", args),
   deleteCategory: (id: number) => invoke<void>("delete_category", { id }),
 
@@ -115,6 +117,12 @@ export const api = {
     invoke<void>("unsplit_transaction", { parentId }),
   getTransaction: (id: number) =>
     invoke<TxnWithChildren>("get_transaction", { id }),
+  materializeOccurrence: (args: {
+    billId: number;
+    date: string;
+    amount: number;
+    cleared: boolean;
+  }) => invoke<number>("materialize_occurrence", args),
 
   listPayPeriodSchedules: () =>
     invoke<PayPeriodSchedule[]>("list_pay_period_schedules"),
@@ -179,8 +187,8 @@ export const api = {
     invoke<number>("upsert_budget_allocation", { allocation }),
   deleteBudgetAllocation: (id: number) =>
     invoke<void>("delete_budget_allocation", { id }),
-  budgetSummary: (start: string, end: string) =>
-    invoke<BudgetSummary>("budget_summary", { start, end }),
+  budgetSummary: (start: string, end: string, monthStart: string, monthEnd: string) =>
+    invoke<BudgetSummary>("budget_summary", { start, end, monthStart, monthEnd }),
 
   listRecurringBills: () => invoke<RecurringBill[]>("list_recurring_bills"),
   upsertRecurringBill: (bill: RecurringBill) =>

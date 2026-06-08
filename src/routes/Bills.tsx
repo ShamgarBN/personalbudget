@@ -14,12 +14,47 @@ const blank = (): RecurringBill => ({
   cadence_kind: "monthly",
   day_of_month: 1,
   anchor_date: null,
+  interval_days: null,
   active: true,
   last_seen_date: null,
   notes: null,
   start_date: todayISO(),
   end_date: null,
 });
+
+// Per-month equivalent count for each cadence — used to estimate a monthly net.
+function monthlyMultiplier(b: RecurringBill): number {
+  switch (b.cadence_kind) {
+    case "monthly":
+      return 1;
+    case "quarterly":
+      return 1 / 3;
+    case "semiannual":
+      return 1 / 6;
+    case "annual":
+      return 1 / 12;
+    case "biweekly":
+      return 26 / 12;
+    case "weekly":
+      return 52 / 12;
+    case "custom_days":
+      return b.interval_days && b.interval_days > 0 ? 30.4368 / b.interval_days : 0;
+    default:
+      return 0;
+  }
+}
+
+function describeCadence(b: RecurringBill): string {
+  if (b.cadence_kind === "custom_days") {
+    const n = b.interval_days ?? 0;
+    if (n > 0 && n % 7 === 0) {
+      const w = n / 7;
+      return `Every ${w} week${w === 1 ? "" : "s"}`;
+    }
+    return `Every ${n} day${n === 1 ? "" : "s"}`;
+  }
+  return b.cadence_kind.charAt(0).toUpperCase() + b.cadence_kind.slice(1);
+}
 
 export default function Bills() {
   const qc = useQueryClient();
@@ -67,6 +102,20 @@ export default function Bills() {
   }, [bills.data, categories.data]);
 
   const [draft, setDraft] = useState<RecurringBill | null>(null);
+  // UI-only editor state. Amount is edited as a positive magnitude plus an
+  // expense/income toggle; the signed value is assembled on save. Custom
+  // cadence is entered in days or weeks.
+  const [billKind, setBillKind] = useState<"expense" | "income">("expense");
+  const [customUnit, setCustomUnit] = useState<"days" | "weeks">("days");
+  const openEditor = (b: RecurringBill) => {
+    setBillKind(b.amount > 0 ? "income" : "expense");
+    setCustomUnit(
+      b.cadence_kind === "custom_days" && b.interval_days && b.interval_days % 7 === 0
+        ? "weeks"
+        : "days",
+    );
+    setDraft(b);
+  };
 
   const save = useMutation({
     mutationFn: (b: RecurringBill) => api.upsertRecurringBill(b),
@@ -80,40 +129,29 @@ export default function Bills() {
     onSuccess: () => qc.invalidateQueries({ queryKey: ["recurring-bills"] }),
   });
 
+  // Net monthly estimate: income (positive) minus expenses (negative), each
+  // scaled to a per-month equivalent by cadence.
   const monthlyTotal = (bills.data ?? [])
     .filter((b) => b.active)
-    .reduce((s, b) => {
-      const mult =
-        b.cadence_kind === "monthly"
-          ? 1
-          : b.cadence_kind === "quarterly"
-            ? 1 / 3
-            : b.cadence_kind === "semiannual"
-              ? 1 / 6
-              : b.cadence_kind === "annual"
-                ? 1 / 12
-                : b.cadence_kind === "biweekly"
-                  ? 26 / 12
-                  : b.cadence_kind === "weekly"
-                    ? 52 / 12
-                    : 0;
-      return s + Math.abs(b.amount) * mult;
-    }, 0);
+    .reduce((s, b) => s + b.amount * monthlyMultiplier(b), 0);
 
   return (
     <div className="p-6 space-y-4">
       <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-semibold">Recurring Bills</h1>
+        <h1 className="text-2xl font-semibold">Recurring Transactions</h1>
         <div className="text-sm text-gray-700">
-          Estimated monthly: <span className="font-semibold">{fmtUSD(monthlyTotal)}</span>
+          Estimated monthly net:{" "}
+          <span className={`font-semibold ${monthlyTotal < 0 ? "text-red-700" : "text-green-700"}`}>
+            {fmtUSD(monthlyTotal)}
+          </span>
         </div>
       </div>
 
       <button
-        onClick={() => setDraft(blank())}
+        onClick={() => openEditor(blank())}
         className="px-3 py-1.5 text-sm rounded-md bg-black text-white"
       >
-        Add bill
+        Add transaction
       </button>
 
       <div className="rounded-xl border border-gray-200 bg-white overflow-hidden">
@@ -152,18 +190,18 @@ export default function Bills() {
                           )}
                         </div>
                         <div className="text-xs text-gray-600">
-                          {b.cadence_kind}
-                          {b.day_of_month != null && b.cadence_kind.startsWith("month")
-                            ? ` · day ${b.day_of_month}`
-                            : ""}
-                          {b.anchor_date ? ` · anchor ${b.anchor_date}` : ""}
+                          {describeCadence(b)}
                           {b.start_date ? ` · starts ${fmtDate(b.start_date)}` : ""}
                           {b.end_date ? ` · ends ${fmtDate(b.end_date)}` : ""}
                           {!b.active ? " · paused" : ""}
                         </div>
                       </div>
-                      <div className="tabular-nums text-gray-900">{fmtUSD(Math.abs(b.amount))}</div>
-                      <button onClick={() => setDraft(b)} className="text-xs text-gray-600 hover:text-black">
+                      <div
+                        className={`tabular-nums ${b.amount < 0 ? "text-red-700" : "text-green-700"}`}
+                      >
+                        {fmtUSD(b.amount)}
+                      </div>
+                      <button onClick={() => openEditor(b)} className="text-xs text-gray-600 hover:text-black">
                         Edit
                       </button>
                       <button
@@ -186,7 +224,9 @@ export default function Bills() {
       {draft && (
         <div className="fixed inset-0 z-30 flex items-center justify-center bg-black/30">
           <div className="bg-white rounded-xl shadow-xl w-[480px] p-5 space-y-3">
-            <h2 className="font-semibold">{draft.id ? "Edit bill" : "Add bill"}</h2>
+            <h2 className="font-semibold">
+              {draft.id ? "Edit recurring transaction" : "Add recurring transaction"}
+            </h2>
             <Field label="Name">
               <input
                 className="border rounded px-2 py-1 w-full text-sm bg-white"
@@ -195,32 +235,100 @@ export default function Bills() {
               />
             </Field>
             <div className="grid grid-cols-2 gap-3">
-              <Field label="Amount (positive)">
+              <Field label="Type">
+                <div className="flex rounded-md border border-gray-200 overflow-hidden text-sm">
+                  {(["expense", "income"] as const).map((k) => (
+                    <button
+                      key={k}
+                      type="button"
+                      onClick={() => setBillKind(k)}
+                      className={`flex-1 px-2 py-1 capitalize ${
+                        billKind === k
+                          ? k === "income"
+                            ? "bg-green-600 text-white"
+                            : "bg-red-600 text-white"
+                          : "bg-white text-gray-700 hover:bg-gray-50"
+                      }`}
+                    >
+                      {k}
+                    </button>
+                  ))}
+                </div>
+              </Field>
+              <Field label="Amount">
                 <input
                   type="number"
                   step="0.01"
-                  className="border rounded px-2 py-1 w-full text-sm bg-white"
-                  value={draft.amount}
-                  onChange={(e) => setDraft({ ...draft, amount: parseFloat(e.target.value) || 0 })}
+                  min={0}
+                  className="border rounded px-2 py-1 w-full text-sm bg-white text-right tabular-nums"
+                  value={draft.amount === 0 ? "" : Math.abs(draft.amount)}
+                  onChange={(e) =>
+                    setDraft({ ...draft, amount: Math.abs(parseFloat(e.target.value) || 0) })
+                  }
                 />
               </Field>
-              <Field label="Cadence">
-                <select
-                  className="border rounded px-2 py-1 w-full text-sm bg-white"
-                  value={draft.cadence_kind}
-                  onChange={(e) =>
-                    setDraft({ ...draft, cadence_kind: e.target.value as RecurringBill["cadence_kind"] })
-                  }
-                >
-                  <option value="weekly">Weekly</option>
-                  <option value="biweekly">Biweekly</option>
-                  <option value="monthly">Monthly</option>
-                  <option value="quarterly">Quarterly</option>
-                  <option value="semiannual">Semiannual</option>
-                  <option value="annual">Annual</option>
-                </select>
-              </Field>
             </div>
+            <Field label="Cadence">
+              <select
+                className="border rounded px-2 py-1 w-full text-sm bg-white"
+                value={draft.cadence_kind}
+                onChange={(e) =>
+                  setDraft({
+                    ...draft,
+                    cadence_kind: e.target.value as RecurringBill["cadence_kind"],
+                    interval_days:
+                      e.target.value === "custom_days" ? draft.interval_days ?? 30 : null,
+                  })
+                }
+              >
+                <option value="weekly">Weekly</option>
+                <option value="biweekly">Biweekly</option>
+                <option value="monthly">Monthly</option>
+                <option value="quarterly">Quarterly</option>
+                <option value="semiannual">Semiannual</option>
+                <option value="annual">Annual</option>
+                <option value="custom_days">Custom (every N days/weeks)</option>
+              </select>
+            </Field>
+            {draft.cadence_kind === "custom_days" && (
+              <Field label="Repeat every">
+                <div className="flex items-center gap-2">
+                  <input
+                    type="number"
+                    min={1}
+                    className="border rounded px-2 py-1 w-24 text-sm bg-white text-right tabular-nums"
+                    value={
+                      customUnit === "weeks"
+                        ? Math.max(1, Math.round((draft.interval_days ?? 7) / 7))
+                        : draft.interval_days ?? 1
+                    }
+                    onChange={(e) => {
+                      const n = Math.max(1, parseInt(e.target.value, 10) || 1);
+                      setDraft({
+                        ...draft,
+                        interval_days: customUnit === "weeks" ? n * 7 : n,
+                      });
+                    }}
+                  />
+                  <select
+                    className="border rounded px-2 py-1 text-sm bg-white"
+                    value={customUnit}
+                    onChange={(e) => {
+                      const unit = e.target.value as "days" | "weeks";
+                      // Re-express the current interval in the new unit.
+                      const days = draft.interval_days ?? 7;
+                      const n =
+                        unit === "weeks" ? Math.max(1, Math.round(days / 7)) : days;
+                      setCustomUnit(unit);
+                      setDraft({ ...draft, interval_days: unit === "weeks" ? n * 7 : n });
+                    }}
+                  >
+                    <option value="days">days</option>
+                    <option value="weeks">weeks</option>
+                  </select>
+                </div>
+              </Field>
+            )}
             <div className="grid grid-cols-2 gap-3">
               <Field label="Account">
                 <select
@@ -256,33 +364,6 @@ export default function Bills() {
                 </select>
               </Field>
             </div>
-            {(draft.cadence_kind === "monthly" ||
-              draft.cadence_kind === "quarterly" ||
-              draft.cadence_kind === "semiannual" ||
-              draft.cadence_kind === "annual") && (
-              <Field label="Day of month">
-                <input
-                  type="number"
-                  min={1}
-                  max={31}
-                  className="border rounded px-2 py-1 w-24 text-sm bg-white"
-                  value={draft.day_of_month ?? 1}
-                  onChange={(e) =>
-                    setDraft({ ...draft, day_of_month: parseInt(e.target.value, 10) || 1 })
-                  }
-                />
-              </Field>
-            )}
-            {(draft.cadence_kind === "weekly" || draft.cadence_kind === "biweekly") && (
-              <Field label="Anchor date (a known hit date)">
-                <input
-                  type="date"
-                  className="border rounded px-2 py-1 text-sm bg-white"
-                  value={draft.anchor_date ?? ""}
-                  onChange={(e) => setDraft({ ...draft, anchor_date: e.target.value || null })}
-                />
-              </Field>
-            )}
             <div className="grid grid-cols-2 gap-3">
               <Field label="Start date">
                 <input
@@ -305,6 +386,10 @@ export default function Bills() {
                 />
               </Field>
             </div>
+            <p className="text-xs text-gray-500">
+              It recurs on the start date's day going forward — e.g. start Jun 8, monthly → Jul 8,
+              Aug 8, and so on.
+            </p>
             <label className="flex items-center gap-2 text-sm">
               <input
                 type="checkbox"
@@ -318,8 +403,30 @@ export default function Bills() {
                 Cancel
               </button>
               <button
-                disabled={!draft.name.trim() || !draft.account_id}
-                onClick={() => save.mutate(draft)}
+                disabled={
+                  !draft.name.trim() ||
+                  !draft.account_id ||
+                  (draft.cadence_kind === "custom_days" && !(draft.interval_days && draft.interval_days > 0))
+                }
+                onClick={() => {
+                  // Derive the recurrence anchor from the start date so the user
+                  // never enters a day-of-month separately. day_of_month feeds the
+                  // monthly-family math; anchor_date feeds weekly/biweekly/custom.
+                  const start = draft.start_date ?? todayISO();
+                  const startDom = parseInt(start.slice(8, 10), 10) || 1;
+                  const signed =
+                    billKind === "income" ? Math.abs(draft.amount) : -Math.abs(draft.amount);
+                  const final: RecurringBill = {
+                    ...draft,
+                    amount: signed,
+                    start_date: start,
+                    day_of_month: startDom,
+                    anchor_date: start,
+                    interval_days:
+                      draft.cadence_kind === "custom_days" ? draft.interval_days ?? null : null,
+                  };
+                  save.mutate(final);
+                }}
                 className="px-3 py-1.5 text-sm rounded bg-black text-white disabled:opacity-50"
               >
                 Save

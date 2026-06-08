@@ -29,19 +29,36 @@ pub fn preview_import(state: State<AppState>, args: PreviewArgs) -> AppResult<Im
         )?;
         (id, name)
     } else {
-        // Match account_hint against existing accounts.
+        // Prefer an exact name match against the parser's hint, but fall back
+        // to the account *kind* implied by the detected format. Resolving by
+        // kind keeps import working after an account is renamed (e.g.
+        // "Joint Checking" -> "Bank Account") — the format unambiguously maps
+        // to exactly one account kind in this single-household app.
         let hint = parsed.account_hint.clone();
-        let row = conn.query_row(
-            "SELECT id, name FROM account WHERE LOWER(name) = LOWER(?) LIMIT 1",
+        let by_name = conn.query_row(
+            "SELECT id, name FROM account WHERE LOWER(name) = LOWER(?) AND archived = 0 LIMIT 1",
             rusqlite::params![hint],
             |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
         );
-        match row {
+        match by_name {
             Ok(x) => x,
             Err(_) => {
-                return Err(AppError::Invalid(format!(
-                    "no account named '{hint}' — pick one explicitly"
-                )))
+                let kind = match parsed.format.as_str() {
+                    "apple_card" => "credit",
+                    "bofa_checking" => "checking",
+                    "capital_one_savings" => "savings",
+                    _ => "",
+                };
+                conn.query_row(
+                    "SELECT id, name FROM account WHERE kind = ? AND archived = 0 ORDER BY display_order LIMIT 1",
+                    rusqlite::params![kind],
+                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+                )
+                .map_err(|_| {
+                    AppError::Invalid(format!(
+                        "couldn't match an account for '{hint}' — pick one explicitly"
+                    ))
+                })?
             }
         }
     };

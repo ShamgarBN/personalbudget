@@ -1,6 +1,6 @@
 [package]
 name = "family-budget"
-version = "1.1.0"
+version = "1.2.0"
 description = "Family Budget"
 authors = ["Ben Niemann"]
 edition = "2021"

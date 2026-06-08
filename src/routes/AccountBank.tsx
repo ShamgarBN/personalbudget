@@ -8,6 +8,7 @@ export default function AccountBank() {
       halfMonthCollapse
       showPinnedCcPayment
       showCcStartingBalance
+      showProjections
     />
   );
 }

@@ -39,9 +39,20 @@ export default function Budgets() {
   const idx = activePeriod || currentIdx;
   const period = periods.data?.[idx];
 
+  // Calendar month containing the period start — monthly-basis categories
+  // measure their spend against this window instead of the pay period.
+  const monthBounds = useMemo(() => {
+    const base = period?.start ?? todayISO();
+    const d = new Date(base + "T00:00:00");
+    const ms = new Date(d.getFullYear(), d.getMonth(), 1);
+    const me = new Date(d.getFullYear(), d.getMonth() + 1, 1);
+    const iso = (x: Date) => x.toISOString().slice(0, 10);
+    return { start: iso(ms), end: iso(me), label: ms.toLocaleDateString("en-US", { month: "long", year: "numeric" }) };
+  }, [period?.start]);
+
   const summary = useQuery({
-    queryKey: ["budget-summary", period?.start, period?.end],
-    queryFn: () => api.budgetSummary(period!.start, period!.end),
+    queryKey: ["budget-summary", period?.start, period?.end, monthBounds.start, monthBounds.end],
+    queryFn: () => api.budgetSummary(period!.start, period!.end, monthBounds.start, monthBounds.end),
     enabled: !!period,
   });
 
@@ -69,9 +80,11 @@ export default function Budgets() {
   });
 
   const rows = summary.data?.rows ?? [];
+  const ppRows = rows.filter((r) => r.budget_basis === "per_pay_period");
+  const moRows = rows.filter((r) => r.budget_basis === "monthly");
   const totalAllocated = rows.reduce((s, r) => s + r.allocated, 0);
   const totalSpent = rows.reduce((s, r) => s + r.spent, 0);
-  const unbudgeted = rows.filter((r) => r.allocated === 0).length;
+  const overBudget = rows.filter((r) => r.available < 0).length;
 
   return (
     <div className="p-6 space-y-4 text-gray-900">
@@ -79,9 +92,9 @@ export default function Budgets() {
         <div>
           <h1 className="text-2xl font-semibold text-gray-900">Budgets</h1>
           <p className="text-xs text-gray-700 mt-1 max-w-2xl">
-            Set a per-pay-period limit for each category. Unspent amounts roll into the next
-            period (the &quot;Rollover in&quot; column); overspends drag it negative. To get
-            started, type a dollar amount into the Allocation field on any category row.
+            Choose which categories appear here in Settings (the <em>Budgeted</em> checkbox) and
+            whether each is measured per pay period or per month. Each period starts fresh — there's
+            no rollover. Type a dollar amount into the Allocation field to set a limit.
           </p>
         </div>
         <div className="flex items-center gap-2 text-sm">
@@ -119,37 +132,77 @@ export default function Budgets() {
           </div>
         </div>
         <div className="rounded-xl border border-gray-200 bg-white p-3">
-          <div className="text-xs uppercase tracking-wide text-gray-600">Categories unbudgeted</div>
-          <div className="text-lg font-semibold text-gray-900 mt-1">
-            {unbudgeted}
+          <div className="text-xs uppercase tracking-wide text-gray-600">Over budget</div>
+          <div className={`text-lg font-semibold mt-1 ${overBudget > 0 ? "text-red-700" : "text-gray-900"}`}>
+            {overBudget}
             <span className="text-xs text-gray-700 font-normal ml-2">of {rows.length}</span>
           </div>
         </div>
       </div>
 
+      {rows.length === 0 ? (
+        <div className="rounded-xl border border-gray-200 bg-white px-3 py-10 text-center text-sm text-gray-700">
+          No budgeted categories yet. In Settings, check <span className="font-medium">Budgeted</span>{" "}
+          next to the categories you want to track here.
+        </div>
+      ) : (
+        <div className="space-y-4">
+          <BudgetSection
+            title="Per pay period"
+            subtitle={period ? `${fmtDate(period.start)} – ${fmtDate(period.end)}` : ""}
+            rows={ppRows}
+            onSave={(categoryId, amount) => upsert.mutate({ categoryId, amount })}
+          />
+          <BudgetSection
+            title="Per month"
+            subtitle={monthBounds.label}
+            rows={moRows}
+            onSave={(categoryId, amount) => upsert.mutate({ categoryId, amount })}
+          />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function BudgetSection({
+  title,
+  subtitle,
+  rows,
+  onSave,
+}: {
+  title: string;
+  subtitle: string;
+  rows: BudgetSummaryRow[];
+  onSave: (categoryId: number, amount: number) => void;
+}) {
+  if (rows.length === 0) return null;
+  return (
+    <div>
+      <div className="flex items-baseline gap-2 mb-1.5">
+        <h2 className="text-sm font-semibold text-gray-800">{title}</h2>
+        {subtitle && <span className="text-xs text-gray-500">{subtitle}</span>}
+      </div>
       <div className="rounded-xl border border-gray-200 bg-white overflow-auto shadow-sm">
         <table className="w-full text-sm">
           <thead className="bg-gray-50">
             <tr className="text-left text-xs uppercase tracking-wide text-gray-700">
               <th className="px-3 py-2">Category</th>
-              <th className="px-3 py-2 text-right">Allocation / period</th>
-              <th className="px-3 py-2 text-right">Rollover in</th>
+              <th className="px-3 py-2 text-right">Allocation</th>
               <th className="px-3 py-2 text-right">Spent</th>
               <th className="px-3 py-2 text-right">Available</th>
-              <th className="px-3 py-2"></th>
+              <th className="px-3 py-2 w-32"></th>
             </tr>
           </thead>
           <tbody>
-            {rows.map((r: BudgetSummaryRow) => (
+            {rows.map((r) => (
               <tr
                 key={r.category_id}
                 className={`border-t border-gray-200 ${r.parent_id ? "bg-gray-50/40" : ""}`}
               >
                 <td
                   className={`px-3 py-2 ${
-                    r.parent_id
-                      ? "pl-8 font-normal text-gray-800"
-                      : "font-medium text-gray-900"
+                    r.parent_id ? "pl-8 font-normal text-gray-800" : "font-medium text-gray-900"
                   }`}
                 >
                   {r.parent_id && <span className="text-gray-400 mr-1">↳</span>}
@@ -158,39 +211,22 @@ export default function Budgets() {
                 <td className="px-3 py-2 text-right tabular-nums">
                   <BudgetInput
                     initial={r.allocated}
-                    onSave={(amount) =>
-                      upsert.mutate({ categoryId: r.category_id, amount })
-                    }
+                    onSave={(amount) => onSave(r.category_id, amount)}
                   />
                 </td>
+                <td className="px-3 py-2 text-right tabular-nums text-red-700">{fmtUSD(r.spent)}</td>
                 <td
-                  className={`px-3 py-2 text-right tabular-nums ${r.rollover_in < 0 ? "text-red-700" : "text-gray-700"}`}
-                >
-                  {fmtUSD(r.rollover_in)}
-                </td>
-                <td className="px-3 py-2 text-right tabular-nums text-red-700">
-                  {fmtUSD(r.spent)}
-                </td>
-                <td
-                  className={`px-3 py-2 text-right tabular-nums ${r.available < 0 ? "text-red-700 font-medium" : "text-green-700"}`}
+                  className={`px-3 py-2 text-right tabular-nums ${
+                    r.available < 0 ? "text-red-700 font-medium" : "text-green-700"
+                  }`}
                 >
                   {fmtUSD(r.available)}
                 </td>
                 <td className="px-3 py-2 w-32">
-                  <Bar
-                    used={Math.max(0, r.spent)}
-                    of={Math.max(r.allocated + r.rollover_in, r.spent, 1)}
-                  />
+                  <Bar used={Math.max(0, r.spent)} of={Math.max(r.allocated, r.spent, 1)} />
                 </td>
               </tr>
             ))}
-            {rows.length === 0 && (
-              <tr>
-                <td colSpan={6} className="px-3 py-10 text-center text-sm text-gray-700">
-                  No editable categories yet. Add categories in Settings to start budgeting.
-                </td>
-              </tr>
-            )}
           </tbody>
         </table>
       </div>

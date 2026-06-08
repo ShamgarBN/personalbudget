@@ -21,6 +21,12 @@ pub struct Category {
     pub is_income: bool,
     pub color: Option<String>,
     pub archived: bool,
+    /// Whether this category participates in the Budgets tab. Categories not
+    /// flagged as budgeted are excluded from budget allocation and summaries.
+    pub is_budgeted: bool,
+    /// "monthly" or "per_pay_period" — the window a budgeted category's
+    /// allocation is measured against.
+    pub budget_basis: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,6 +44,8 @@ pub struct Transaction {
     pub flagged: bool,
     pub needs_review: bool,
     pub split_of_id: Option<i64>,
+    /// The recurring transaction this row was materialized from, if any.
+    pub from_bill_id: Option<i64>,
     /// Account balance immediately after this transaction posted, computed
     /// over the full history for this account regardless of any active filter.
     /// Null for split children (their amounts roll up under the parent).

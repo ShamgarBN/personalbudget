@@ -345,9 +345,19 @@ export default function Dashboard() {
     queryFn: () =>
       api.listTransactions({ date_from: range.from, date_to: range.to, limit: 500 }),
   });
+  // Calendar-month window containing the selected range start — used so
+  // monthly-basis budget categories measure spend against their month.
+  const monthBounds = useMemo(() => {
+    const d = new Date(range.from + "T00:00:00");
+    const ms = new Date(d.getFullYear(), d.getMonth(), 1);
+    const me = new Date(d.getFullYear(), d.getMonth() + 1, 1);
+    const iso = (x: Date) => x.toISOString().slice(0, 10);
+    return { start: iso(ms), end: iso(me) };
+  }, [range.from]);
   const budgetSummary = useQuery({
-    queryKey: ["budget-summary", range.from, range.to],
-    queryFn: () => api.budgetSummary(range.from, shiftIso(range.to, 1)),
+    queryKey: ["budget-summary", range.from, range.to, monthBounds.start, monthBounds.end],
+    queryFn: () =>
+      api.budgetSummary(range.from, shiftIso(range.to, 1), monthBounds.start, monthBounds.end),
   });
 
   // ---------------------------- derived ----------------------------
@@ -372,7 +382,9 @@ export default function Dashboard() {
 
   const upcoming14 = useMemo(() => projectUpcoming(bills.data ?? [], 14), [bills.data]);
   const upcoming7 = useMemo(() => projectUpcoming(bills.data ?? [], 7), [bills.data]);
-  const upcoming14Total = upcoming14.reduce((s, b) => s + Math.abs(b.amount), 0);
+  // Only expense occurrences (signed negative) reduce free cash; recurring
+  // income is ignored here so the "spendable" number stays conservative.
+  const upcoming14Total = upcoming14.reduce((s, b) => s + (b.amount < 0 ? -b.amount : 0), 0);
 
   const freeCash = liveByKind.checking - upcoming14Total - Math.abs(liveByKind.credit);
 
@@ -788,8 +800,10 @@ function ActionCallouts({
       );
     });
   }, [upcoming7, bills]);
-  const upcoming7Total = upcoming7.reduce((s, b) => s + Math.abs(b.amount), 0);
-  const anything = needsReviewCount > 0 || upcoming7.length > 0;
+  // "Bills due" means expense occurrences only — recurring income isn't a bill.
+  const expensesSoon = upcoming7.filter((b) => b.amount < 0);
+  const upcoming7Total = expensesSoon.reduce((s, b) => s + -b.amount, 0);
+  const anything = needsReviewCount > 0 || expensesSoon.length > 0;
   if (!anything && creditBalance >= 0) return null;
   return (
     <div className="flex flex-wrap gap-2">
@@ -802,13 +816,13 @@ function ActionCallouts({
           {needsReviewCount} transaction{needsReviewCount === 1 ? "" : "s"} need review →
         </Link>
       )}
-      {upcoming7.length > 0 && (
+      {expensesSoon.length > 0 && (
         <Link
           to="/bills"
           className="flex items-center gap-2 rounded-full border border-gray-300 bg-gray-50 px-3 py-1.5 text-xs font-medium text-gray-800 hover:bg-gray-100"
         >
           <span className="inline-block w-1.5 h-1.5 rounded-full bg-gray-500" />
-          {upcoming7.length} bill{upcoming7.length === 1 ? "" : "s"} due in 7 days ·{" "}
+          {expensesSoon.length} bill{expensesSoon.length === 1 ? "" : "s"} due in 7 days ·{" "}
           {fmtUSD(upcoming7Total)} →
         </Link>
       )}
@@ -1398,8 +1412,10 @@ function UpcomingBillsWidget({ upcoming }: { upcoming: UpcomingBill[] }) {
                 {fmtDate(b.next)}
               </div>
               <div className="flex-1 min-w-0 text-sm text-gray-900 truncate">{b.name}</div>
-              <div className="text-sm font-medium tabular-nums text-red-700">
-                {fmtUSD(-Math.abs(b.amount))}
+              <div
+                className={`text-sm font-medium tabular-nums ${b.amount < 0 ? "text-red-700" : "text-green-700"}`}
+              >
+                {fmtUSD(b.amount)}
               </div>
             </div>
           ))}
@@ -1560,6 +1576,13 @@ function billHitsOn(b: RecurringBill, date: Date): boolean {
       const diff = Math.round((date.getTime() - a.getTime()) / 86400000);
       const step = b.cadence_kind === "weekly" ? 7 : 14;
       return diff >= 0 && diff % step === 0;
+    }
+    case "custom_days": {
+      const anchor = b.anchor_date ?? b.start_date;
+      if (!anchor || !b.interval_days || b.interval_days <= 0) return false;
+      const a = new Date(anchor + "T00:00:00");
+      const diff = Math.round((date.getTime() - a.getTime()) / 86400000);
+      return diff >= 0 && diff % b.interval_days === 0;
     }
     default:
       return false;

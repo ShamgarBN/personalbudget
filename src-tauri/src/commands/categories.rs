@@ -8,7 +8,7 @@ use crate::AppState;
 pub fn list_categories(state: State<AppState>) -> AppResult<Vec<Category>> {
     let conn = state.conn.lock();
     let mut stmt = conn.prepare(
-        "SELECT id, name, parent_id, is_protected, is_income, color, archived \
+        "SELECT id, name, parent_id, is_protected, is_income, color, archived, is_budgeted, budget_basis \
          FROM category ORDER BY COALESCE(parent_id, 0), name",
     )?;
     let rows = stmt
@@ -21,6 +21,8 @@ pub fn list_categories(state: State<AppState>) -> AppResult<Vec<Category>> {
                 is_income: r.get::<_, i64>(4)? != 0,
                 color: r.get(5)?,
                 archived: r.get::<_, i64>(6)? != 0,
+                is_budgeted: r.get::<_, i64>(7)? != 0,
+                budget_basis: r.get(8)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -51,6 +53,8 @@ pub fn update_category(
     parent_id: Option<Option<i64>>,
     color: Option<String>,
     archived: Option<bool>,
+    is_budgeted: Option<bool>,
+    budget_basis: Option<String>,
 ) -> AppResult<()> {
     let conn = state.conn.lock();
     let is_protected: i64 = conn.query_row(
@@ -74,6 +78,15 @@ pub fn update_category(
     }
     if let Some(a) = archived {
         conn.execute("UPDATE category SET archived=? WHERE id=?", rusqlite::params![a as i64, id])?;
+    }
+    if let Some(b) = is_budgeted {
+        conn.execute("UPDATE category SET is_budgeted=? WHERE id=?", rusqlite::params![b as i64, id])?;
+    }
+    if let Some(basis) = budget_basis {
+        if basis != "monthly" && basis != "per_pay_period" {
+            return Err(AppError::Invalid(format!("invalid budget_basis: {basis}")));
+        }
+        conn.execute("UPDATE category SET budget_basis=? WHERE id=?", rusqlite::params![basis, id])?;
     }
     Ok(())
 }

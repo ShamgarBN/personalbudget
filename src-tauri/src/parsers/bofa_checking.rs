@@ -75,7 +75,7 @@ pub fn parse(content: &str) -> Result<ParsedFile, ParseError> {
 
     Ok(ParsedFile {
         format: "bofa_checking".into(),
-        account_hint: "Joint Checking".into(),
+        account_hint: "Bank Account".into(),
         beginning_balance,
         beginning_balance_date,
         rows,

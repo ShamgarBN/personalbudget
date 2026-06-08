@@ -21,7 +21,13 @@ const basename = (p: string): string => {
   return idx >= 0 ? norm.slice(idx + 1) : norm;
 };
 
-export default function ImportView() {
+export default function ImportModal({
+  open,
+  onOpenChange,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+}) {
   const qc = useQueryClient();
   const accounts = useQuery({ queryKey: ["accounts"], queryFn: api.listAccounts });
   const categories = useQuery({ queryKey: ["categories"], queryFn: api.listCategories });
@@ -94,6 +100,8 @@ export default function ImportView() {
         const paths = event.payload.paths;
         if (!paths || paths.length === 0) return;
         const path = paths[0];
+        // A drop anywhere on the page opens the import modal and processes it.
+        onOpenChange(true);
         try {
           const content = await readTextFile(path);
           await processContent(basename(path), content);
@@ -112,7 +120,7 @@ export default function ImportView() {
       cancelled = true;
       if (unlistenFn) unlistenFn();
     };
-  }, [processContent]);
+  }, [processContent, onOpenChange]);
 
   const commit = useMutation({
     mutationFn: async () => {
@@ -181,9 +189,29 @@ export default function ImportView() {
   const accountName = (id: number) =>
     accounts.data?.find((a) => a.id === id)?.name ?? `#${id}`;
 
+  if (!open) return null;
+
   return (
-    <div className="p-6 space-y-6">
-      <h1 className="text-2xl font-semibold">Import</h1>
+    <div
+      className="fixed inset-0 z-40 flex items-start justify-center bg-black/30 p-6 overflow-auto"
+      onClick={() => onOpenChange(false)}
+    >
+      <div
+        className="bg-white rounded-xl shadow-2xl w-[920px] max-w-full p-6 space-y-6"
+        onClick={(e) => e.stopPropagation()}
+      >
+      <div className="flex items-center justify-between">
+        <h1 className="text-xl font-semibold">Import</h1>
+        <button
+          onClick={() => {
+            clearPreview();
+            onOpenChange(false);
+          }}
+          className="text-sm text-gray-500 hover:text-black"
+        >
+          Close ✕
+        </button>
+      </div>
 
       <div
         className="rounded-xl border-2 border-dashed border-gray-300 bg-white px-8 py-10 text-center"
@@ -430,6 +458,7 @@ export default function ImportView() {
             <div className="px-4 py-6 text-sm text-gray-500 text-center">No imports yet.</div>
           )}
         </div>
+      </div>
       </div>
     </div>
   );

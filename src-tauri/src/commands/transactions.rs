@@ -48,7 +48,7 @@ pub fn list_transactions(state: State<AppState>, filter: Option<TxnFilter>) -> A
            WHERE t.split_of_id IS NULL \
          ) \
          SELECT t.id, t.account_id, t.date, t.description, t.title, t.category_id, c.name, \
-                t.amount, t.memo, t.cleared, t.flagged, t.needs_review, t.split_of_id, r.bal \
+                t.amount, t.memo, t.cleared, t.flagged, t.needs_review, t.split_of_id, t.from_bill_id, r.bal \
          FROM txn t \
          LEFT JOIN category c ON c.id = t.category_id \
          LEFT JOIN running r ON r.id = t.id \
@@ -124,7 +124,8 @@ pub fn list_transactions(state: State<AppState>, filter: Option<TxnFilter>) -> A
                     flagged: r.get::<_, i64>(10)? != 0,
                     needs_review: r.get::<_, i64>(11)? != 0,
                     split_of_id: r.get(12)?,
-                    running_balance: r.get(13)?,
+                    from_bill_id: r.get(13)?,
+                    running_balance: r.get(14)?,
                 })
             },
         )?
@@ -393,6 +394,7 @@ fn row_to_txn(r: &rusqlite::Row) -> rusqlite::Result<Transaction> {
         flagged: r.get::<_, i64>(10)? != 0,
         needs_review: r.get::<_, i64>(11)? != 0,
         split_of_id: r.get(12)?,
+        from_bill_id: r.get(13)?,
         running_balance: None,
     })
 }
@@ -402,14 +404,14 @@ pub fn get_transaction(state: State<AppState>, id: i64) -> AppResult<TxnWithChil
     let conn = state.conn.lock();
     let parent = conn.query_row(
         "SELECT t.id, t.account_id, t.date, t.description, t.title, t.category_id, c.name, \
-                t.amount, t.memo, t.cleared, t.flagged, t.needs_review, t.split_of_id \
+                t.amount, t.memo, t.cleared, t.flagged, t.needs_review, t.split_of_id, t.from_bill_id \
          FROM txn t LEFT JOIN category c ON c.id=t.category_id WHERE t.id=?",
         rusqlite::params![id],
         row_to_txn,
     )?;
     let mut stmt = conn.prepare(
         "SELECT t.id, t.account_id, t.date, t.description, t.title, t.category_id, c.name, \
-                t.amount, t.memo, t.cleared, t.flagged, t.needs_review, t.split_of_id \
+                t.amount, t.memo, t.cleared, t.flagged, t.needs_review, t.split_of_id, t.from_bill_id \
          FROM txn t LEFT JOIN category c ON c.id=t.category_id \
          WHERE t.split_of_id=? ORDER BY t.id",
     )?;
@@ -417,4 +419,40 @@ pub fn get_transaction(state: State<AppState>, id: i64) -> AppResult<TxnWithChil
         .query_map(rusqlite::params![id], row_to_txn)?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(TxnWithChildren { parent, children })
+}
+
+/// Turn a projected recurring occurrence into a real transaction for a single
+/// date. The recurring template is untouched; future projections continue. The
+/// new row is tagged with `from_bill_id` so the ledger stops projecting a ghost
+/// for that occurrence. `amount` is signed (negative = expense).
+#[tauri::command]
+pub fn materialize_occurrence(
+    state: State<AppState>,
+    bill_id: i64,
+    date: String,
+    amount: f64,
+    cleared: bool,
+) -> AppResult<i64> {
+    let conn = state.conn.lock();
+    let (name, account_id, category_id): (String, i64, Option<i64>) = conn.query_row(
+        "SELECT name, account_id, category_id FROM recurring_bill WHERE id=?",
+        rusqlite::params![bill_id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    // Guard against a double-materialize of the same occurrence.
+    let existing: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM txn WHERE from_bill_id=? AND date=?",
+        rusqlite::params![bill_id, date],
+        |r| r.get(0),
+    )?;
+    if existing > 0 {
+        return Err(AppError::Invalid("occurrence already recorded".into()));
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO txn (account_id, date, description, title, category_id, amount, memo, cleared, flagged, needs_review, from_bill_id, created_at, updated_at) \
+         VALUES (?, ?, ?, NULL, ?, ?, NULL, ?, 0, 0, ?, ?, ?)",
+        rusqlite::params![account_id, date, name, category_id, amount, cleared as i64, bill_id, now, now],
+    )?;
+    Ok(conn.last_insert_rowid())
 }
