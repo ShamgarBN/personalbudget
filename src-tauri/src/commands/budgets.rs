@@ -19,9 +19,10 @@ pub struct BudgetSummaryRow {
     pub category_name: String,
     pub parent_id: Option<i64>,
     pub parent_name: Option<String>,
+    /// "monthly" or "per_pay_period" — which window `spent` was measured over.
+    pub budget_basis: String,
     pub allocated: f64,
     pub spent: f64,
-    pub rollover_in: f64,
     pub available: f64,
 }
 
@@ -100,60 +101,60 @@ pub fn delete_budget_allocation(state: State<AppState>, id: i64) -> AppResult<()
 }
 
 #[tauri::command]
-pub fn budget_summary(state: State<AppState>, start: String, end: String) -> AppResult<BudgetSummary> {
+pub fn budget_summary(
+    state: State<AppState>,
+    start: String,
+    end: String,
+    month_start: String,
+    month_end: String,
+) -> AppResult<BudgetSummary> {
     let conn = state.conn.lock();
-    // Sort parents (parent_id NULL) before their children, then alphabetically within each level.
+    // Only budgeted, non-protected, non-income, non-archived categories appear.
+    // Spend is measured per category over the window matching its basis:
+    //   per_pay_period -> [start, end)              (the selected pay period)
+    //   monthly        -> [month_start, month_end)  (the calendar month it sits in)
+    // No rollover: available is simply allocated - spent each period.
     let mut stmt = conn.prepare(
-        "SELECT c.id, c.name, c.parent_id, p.name AS parent_name, \
+        "SELECT c.id, c.name, c.parent_id, p.name AS parent_name, c.budget_basis, \
                 COALESCE((SELECT SUM(amount) FROM budget_allocation \
-                          WHERE category_id=c.id AND effective_from <= ? \
-                            AND (effective_to IS NULL OR effective_to > ?)), 0) AS allocated, \
+                          WHERE category_id=c.id AND effective_from <= ?1 \
+                            AND (effective_to IS NULL OR effective_to > ?1)), 0) AS allocated, \
                 COALESCE((SELECT SUM(ABS(amount)) FROM txn \
                           WHERE category_id=c.id AND split_of_id IS NULL \
-                            AND date >= ? AND date < ? AND amount < 0), 0) AS spent \
+                            AND date >= ?2 AND date < ?3 AND amount < 0), 0) AS period_spent, \
+                COALESCE((SELECT SUM(ABS(amount)) FROM txn \
+                          WHERE category_id=c.id AND split_of_id IS NULL \
+                            AND date >= ?4 AND date < ?5 AND amount < 0), 0) AS month_spent \
          FROM category c \
          LEFT JOIN category p ON p.id = c.parent_id \
-         WHERE c.archived = 0 AND c.is_protected = 0 AND c.is_income = 0 \
+         WHERE c.archived = 0 AND c.is_protected = 0 AND c.is_income = 0 AND c.is_budgeted = 1 \
          ORDER BY COALESCE(p.name, c.name), (c.parent_id IS NOT NULL), c.name",
     )?;
     let rows: Vec<BudgetSummaryRow> = stmt
-        .query_map(rusqlite::params![start, start, start, end], |r| {
-            Ok(BudgetSummaryRow {
-                category_id: r.get(0)?,
-                category_name: r.get(1)?,
-                parent_id: r.get(2)?,
-                parent_name: r.get(3)?,
-                allocated: r.get(4)?,
-                spent: r.get(5)?,
-                rollover_in: 0.0,
-                available: 0.0,
-            })
-        })?
+        .query_map(
+            rusqlite::params![start, start, end, month_start, month_end],
+            |r| {
+                let basis: String = r.get(4)?;
+                let allocated: f64 = r.get(5)?;
+                let period_spent: f64 = r.get(6)?;
+                let month_spent: f64 = r.get(7)?;
+                let spent = if basis == "monthly" { month_spent } else { period_spent };
+                Ok(BudgetSummaryRow {
+                    category_id: r.get(0)?,
+                    category_name: r.get(1)?,
+                    parent_id: r.get(2)?,
+                    parent_name: r.get(3)?,
+                    budget_basis: basis,
+                    allocated,
+                    spent,
+                    available: allocated - spent,
+                })
+            },
+        )?
         .collect::<Result<Vec<_>, _>>()?;
-    drop(stmt);
-    let mut filled: Vec<BudgetSummaryRow> = Vec::with_capacity(rows.len());
-    for mut row in rows {
-        // Rollover_in: net (allocated - spent) over all completed previous periods since allocation began.
-        // Simple approximation: sum across prior allocations on this category minus prior spend.
-        let prior_alloc: f64 = conn.query_row(
-            "SELECT COALESCE(SUM(amount),0) FROM budget_allocation \
-             WHERE category_id=? AND effective_from < ?",
-            rusqlite::params![row.category_id, start],
-            |r| r.get(0),
-        )?;
-        let prior_spent: f64 = conn.query_row(
-            "SELECT COALESCE(SUM(ABS(amount)),0) FROM txn \
-             WHERE category_id=? AND split_of_id IS NULL AND date < ? AND amount < 0",
-            rusqlite::params![row.category_id, start],
-            |r| r.get(0),
-        )?;
-        row.rollover_in = prior_alloc - prior_spent;
-        row.available = row.allocated + row.rollover_in - row.spent;
-        filled.push(row);
-    }
     Ok(BudgetSummary {
         start,
         end,
-        rows: filled,
+        rows,
     })
 }

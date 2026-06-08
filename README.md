@@ -10,15 +10,16 @@ Built with Tauri 2 (Rust backend, React + TypeScript frontend) so the install is
 
 ## What it does
 
-- **Ledger** — flat or pay-period-grouped transaction view across all accounts. Inline edit description, memo, category, amount. Split transactions across multiple categories.
-- **Per-account views** — Bank Account, Credit Card, and Savings each have a focused ledger. Bank Account also shows a projected credit-card payoff row.
-- **Import** — drag CSV exports from Bank of America (checking), Apple Card, or Capital One 360 Savings. Auto-detects format, suggests categories from merchant memory, flags duplicates, lets you review before committing.
-- **Budgets** — set per-category allocations per pay period. Track spent vs allocated with rollover handling.
-- **Bills** — declare recurring bills (weekly, biweekly, monthly, quarterly, semiannual, annual). The dashboard surfaces what's due in the next 7 / 14 days.
-- **Forecast** — projects daily balances forward using trailing averages and scheduled paydays + bills.
+- **Ledger** — flat or year → pay-period grouped transaction view across all accounts. Inline edit description, memo, category, amount. Split transactions across categories. **Import** lives here: drop a CSV anywhere (or click Import CSV) — auto-detects Bank of America checking, credit-card, and Capital One 360 Savings exports, suggests categories from merchant memory, flags duplicates, and previews before committing. Category colors show as a dot on every row.
+- **Per-account views** — Bank Account, Credit Card, and Savings each have a focused ledger.
+  - *Bank Account* projects recurring transactions forward as editable "ghost" rows for ~2 years, carrying the running balance forward as a forecast; editing an amount or clicking ✓ locks that occurrence in as a real transaction. Credit-card payment rows expand inline to show the card charges they cover (counted once, via the payment).
+  - *Savings* is a plain spreadsheet with no grouping.
+- **Budgets** — only categories you mark *Budgeted* (in Settings) appear, split into Per-pay-period and Per-month sections, each measured against its own window. No rollover — every period starts fresh.
+- **Recurring Transactions** — income or expense, with weekly / biweekly / monthly / quarterly / semiannual / annual / custom "every N days" cadences. Recurrence follows the start date's day. The dashboard surfaces expenses due in the next 7 / 14 days.
+- **Forecast** — projects daily balances forward using trailing averages and scheduled paydays + recurring transactions.
 - **Goals** — track savings/payoff goals with progress bars.
-- **Dashboard** — customizable widget grid (drag/drop, hide/restore, persist layout). Pay-period or month/year time scope with prev/next navigation. Trend charts, category drift, savings rate, largest transactions, free-cash KPI, action callouts for things needing attention.
-- **Settings** — manage categories, pay-period schedules (biweekly, semimonthly, monthly, custom dates), and database backups/restores.
+- **Dashboard** — customizable widget grid (drag/drop, hide/restore, persist layout, even-width rows). Pay-period or month/year time scope with prev/next navigation. Trend charts, category drift, savings rate, largest transactions, free-cash KPI, action callouts for things needing attention.
+- **Settings** — manage categories (edit names, color-code, mark budgeted + monthly/per-period basis, delete or archive), pay-period schedules (biweekly, semimonthly, monthly, custom dates), and database backups/restores.
 
 ---
 
@@ -32,7 +33,7 @@ family-budget/
 │   │   └── types.ts              # DTOs shared with the Rust backend
 │   ├── components/               # Reusable UI (QuickAdd, SplitModal)
 │   ├── lib/                      # Tiny helpers (formatting, category trees, column widths)
-│   ├── routes/                   # One file per tab (Dashboard, Ledger, Bills, etc.)
+│   ├── routes/                   # One file per tab (Dashboard, Ledger, Recurring, etc.)
 │   ├── App.tsx                   # Router + sidebar nav
 │   └── main.tsx                  # React entrypoint
 │

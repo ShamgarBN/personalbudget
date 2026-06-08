@@ -17,6 +17,8 @@ export interface Category {
   is_income: boolean;
   color: string | null;
   archived: boolean;
+  is_budgeted: boolean;
+  budget_basis: "monthly" | "per_pay_period";
 }
 
 export interface Transaction {
@@ -33,6 +35,7 @@ export interface Transaction {
   flagged: boolean;
   needs_review: boolean;
   split_of_id: number | null;
+  from_bill_id: number | null;
   running_balance: number | null;
 }
 
@@ -205,9 +208,9 @@ export interface BudgetSummaryRow {
   category_name: string;
   parent_id: number | null;
   parent_name: string | null;
+  budget_basis: "monthly" | "per_pay_period";
   allocated: number;
   spent: number;
-  rollover_in: number;
   available: number;
 }
 
@@ -229,9 +232,11 @@ export interface RecurringBill {
     | "monthly"
     | "quarterly"
     | "semiannual"
-    | "annual";
+    | "annual"
+    | "custom_days";
   day_of_month: number | null;
   anchor_date: string | null;
+  interval_days: number | null;
   active: boolean;
   last_seen_date: string | null;
   notes: string | null;

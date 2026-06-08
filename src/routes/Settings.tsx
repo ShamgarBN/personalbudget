@@ -53,21 +53,39 @@ export default function Settings() {
     },
   });
 
+  const invalidateCats = () => {
+    qc.invalidateQueries({ queryKey: ["categories"] });
+    qc.invalidateQueries({ queryKey: ["budget-summary"] });
+    qc.invalidateQueries({ queryKey: ["transactions"] });
+  };
+
+  // Single generic updater for color / name / parent / budgeted / basis / archive.
+  const updateCat = useMutation({
+    mutationFn: (args: Parameters<typeof api.updateCategory>[0]) => api.updateCategory(args),
+    onSuccess: invalidateCats,
+    onError: (e) => alert(String(e)),
+  });
+
   const delCat = useMutation({
     mutationFn: (id: number) => api.deleteCategory(id),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["categories"] }),
-  });
-
-  const renameCat = useMutation({
-    mutationFn: (args: { id: number; name: string }) =>
-      api.updateCategory({ id: args.id, name: args.name }),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["categories"] }),
-  });
-
-  const reparentCat = useMutation({
-    mutationFn: (args: { id: number; parentId: number | null }) =>
-      api.updateCategory({ id: args.id, parentId: args.parentId }),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["categories"] }),
+    onSuccess: invalidateCats,
+    onError: (e: unknown, id: number) => {
+      // The backend refuses to delete a category that's still attached to
+      // transactions. Surface that clearly and offer the archive path the
+      // error itself suggests, instead of failing silently (the old bug).
+      const msg = String(e).replace(/^Error:\s*/, "");
+      if (msg.toLowerCase().includes("in use")) {
+        if (
+          confirm(
+            `${msg}\n\nArchive it instead? It'll be hidden from pickers and ledgers, but its existing transactions keep their category.`,
+          )
+        ) {
+          updateCat.mutate({ id, archived: true });
+        }
+      } else {
+        alert(msg);
+      }
+    },
   });
 
   const [newSchedule, setNewSchedule] = useState<PayPeriodSchedule | null>(null);
@@ -167,13 +185,17 @@ export default function Settings() {
       </section>
 
       <section>
-        <h2 className="text-sm font-semibold text-gray-700 mb-3">Categories</h2>
-        <div className="rounded-xl border bg-white max-h-96 overflow-auto">
-          <CategoryTree
+        <h2 className="text-sm font-semibold text-gray-700 mb-1">Categories</h2>
+        <p className="text-xs text-gray-600 mb-3 max-w-2xl">
+          Click a color swatch to recolor a category — the color shows on every ledger row. Check
+          <span className="font-medium"> Budgeted</span> to include a category on the Budgets tab, and
+          pick whether its limit is measured per month or per pay period.
+        </p>
+        <div className="rounded-xl border bg-white max-h-[28rem] overflow-auto">
+          <CategoryTable
             categories={categories.data ?? []}
+            onUpdate={(args) => updateCat.mutate(args)}
             onDelete={(id) => delCat.mutate(id)}
-            onRename={(id, name) => renameCat.mutate({ id, name })}
-            onReparent={(id, parentId) => reparentCat.mutate({ id, parentId })}
           />
         </div>
         <div className="flex gap-2 mt-3">
@@ -534,88 +556,241 @@ function ScheduleEditor({
   );
 }
 
-function CategoryTree({
+// Preset palette for the swatch picker — the seed colors plus a few extras.
+const CATEGORY_COLORS = [
+  "#ff9500", "#ff9f0a", "#ffcc00", "#30d158", "#34c759", "#14b8a6",
+  "#0a84ff", "#5e5ce6", "#64d2ff", "#bf5af2", "#a78bfa", "#ff375f",
+  "#ff453a", "#ff6b6b", "#f97316", "#94a3b8", "#9ca3af", "#888888",
+];
+
+type UpdateCatArgs = Parameters<typeof api.updateCategory>[0];
+
+function CategoryTable({
   categories,
+  onUpdate,
   onDelete,
-  onRename,
-  onReparent,
 }: {
   categories: Category[];
+  onUpdate: (args: UpdateCatArgs) => void;
   onDelete: (id: number) => void;
-  onRename: (id: number, name: string) => void;
-  onReparent: (id: number, parentId: number | null) => void;
 }) {
-  const parents = categories.filter((c) => c.parent_id === null);
-  const childrenOf = (id: number) => categories.filter((c) => c.parent_id === id);
+  const byName = (a: Category, b: Category) => a.name.localeCompare(b.name);
+  const active = categories.filter((c) => !c.archived);
+  const archived = categories.filter((c) => c.archived);
+  const parents = active.filter((c) => c.parent_id === null).slice().sort(byName);
+  const childrenOf = (id: number) =>
+    active.filter((c) => c.parent_id === id).slice().sort(byName);
   const parentOptions = parents.filter((p) => !p.is_protected);
+
+  // Flatten to render order (parent then its children) for zebra striping.
+  const ordered: Array<{ cat: Category; depth: number }> = [];
+  for (const p of parents) {
+    ordered.push({ cat: p, depth: 0 });
+    for (const c of childrenOf(p.id)) ordered.push({ cat: c, depth: 1 });
+  }
+
   return (
-    <ul className="divide-y divide-gray-200">
-      {parents.map((p) => (
-        <li key={p.id} className="px-3 py-1.5">
-          <div className="flex items-center justify-between text-sm">
-            <span className="flex items-center gap-2 flex-1">
-              {p.color && (
-                <span className="inline-block w-2.5 h-2.5 rounded" style={{ background: p.color }} />
-              )}
-              <RenameableName
-                value={p.name}
-                editable={!p.is_protected}
-                onSave={(name) => onRename(p.id, name)}
-              />
-              {p.is_protected && <span className="text-xs text-gray-500">protected</span>}
-            </span>
-            {!p.is_protected && (
-              <button
-                className="text-xs text-gray-500 hover:text-red-700"
-                onClick={() => {
-                  if (confirm(`Delete category "${p.name}"?`)) onDelete(p.id);
-                }}
-              >
-                Delete
-              </button>
-            )}
-          </div>
-          {childrenOf(p.id).length > 0 && (
-            <ul className="ml-5 mt-1 text-sm space-y-0.5">
-              {childrenOf(p.id).map((c) => (
-                <li key={c.id} className="flex items-center justify-between gap-2">
+    <table className="w-full text-sm">
+      <thead className="sticky top-0 bg-gray-50 z-10">
+        <tr className="text-left text-xs uppercase tracking-wide text-gray-600">
+          <th className="px-3 py-2 w-10">Color</th>
+          <th className="px-3 py-2">Category</th>
+          <th className="px-3 py-2 w-20 text-center">Budgeted</th>
+          <th className="px-3 py-2 w-40">Basis</th>
+          <th className="px-3 py-2 w-36">Move to</th>
+          <th className="px-3 py-2 w-16"></th>
+        </tr>
+      </thead>
+      <tbody>
+        {ordered.map(({ cat, depth }, i) => {
+          const canBudget = !cat.is_protected && !cat.is_income;
+          return (
+            <tr
+              key={cat.id}
+              className={`border-t border-gray-100 ${i % 2 === 1 ? "bg-gray-50/60" : "bg-white"}`}
+            >
+              <td className="px-3 py-1.5">
+                <ColorCell
+                  value={cat.color}
+                  onPick={(color) => onUpdate({ id: cat.id, color })}
+                />
+              </td>
+              <td className={`px-3 py-1.5 ${depth === 1 ? "pl-7" : ""}`}>
+                <span className="flex items-center gap-2">
+                  {depth === 1 && <span className="text-gray-400">↳</span>}
                   <RenameableName
-                    value={c.name}
-                    editable={true}
-                    onSave={(name) => onRename(c.id, name)}
+                    value={cat.name}
+                    editable={!cat.is_protected}
+                    onSave={(name) => onUpdate({ id: cat.id, name })}
                   />
-                  <div className="flex items-center gap-2">
-                    <select
-                      className="text-xs border border-gray-200 rounded px-1.5 py-0.5 bg-white"
-                      value={c.parent_id ?? ""}
-                      onChange={(e) =>
-                        onReparent(c.id, e.target.value ? Number(e.target.value) : null)
-                      }
-                      title="Move to a different parent (or 'top level')"
-                    >
-                      <option value="">(top level)</option>
-                      {parentOptions.map((po) => (
-                        <option key={po.id} value={po.id}>
-                          ↳ {po.name}
-                        </option>
-                      ))}
-                    </select>
-                    <button
-                      className="text-xs text-gray-500 hover:text-red-700"
-                      onClick={() => {
-                        if (confirm(`Delete category "${c.name}"?`)) onDelete(c.id);
-                      }}
-                    >
-                      Delete
-                    </button>
-                  </div>
-                </li>
+                  {cat.is_protected && (
+                    <span className="text-[10px] uppercase tracking-wide text-gray-400">
+                      protected
+                    </span>
+                  )}
+                </span>
+              </td>
+              <td className="px-3 py-1.5 text-center">
+                {canBudget ? (
+                  <input
+                    type="checkbox"
+                    checked={cat.is_budgeted}
+                    onChange={(e) => onUpdate({ id: cat.id, isBudgeted: e.target.checked })}
+                    title="Include on the Budgets tab"
+                  />
+                ) : (
+                  <span className="text-gray-300">—</span>
+                )}
+              </td>
+              <td className="px-3 py-1.5">
+                {canBudget && cat.is_budgeted ? (
+                  <select
+                    className="text-xs border border-gray-200 rounded px-1.5 py-0.5 bg-white"
+                    value={cat.budget_basis}
+                    onChange={(e) =>
+                      onUpdate({
+                        id: cat.id,
+                        budgetBasis: e.target.value as "monthly" | "per_pay_period",
+                      })
+                    }
+                  >
+                    <option value="per_pay_period">Per pay period</option>
+                    <option value="monthly">Per month</option>
+                  </select>
+                ) : (
+                  <span className="text-gray-300 text-xs">—</span>
+                )}
+              </td>
+              <td className="px-3 py-1.5">
+                {!cat.is_protected && depth === 1 ? (
+                  <select
+                    className="text-xs border border-gray-200 rounded px-1.5 py-0.5 bg-white w-full"
+                    value={cat.parent_id ?? ""}
+                    onChange={(e) =>
+                      onUpdate({
+                        id: cat.id,
+                        parentId: e.target.value ? Number(e.target.value) : null,
+                      })
+                    }
+                    title="Move to a different parent (or top level)"
+                  >
+                    <option value="">(top level)</option>
+                    {parentOptions.map((po) => (
+                      <option key={po.id} value={po.id}>
+                        {po.name}
+                      </option>
+                    ))}
+                  </select>
+                ) : (
+                  <span className="text-gray-300 text-xs">—</span>
+                )}
+              </td>
+              <td className="px-3 py-1.5 text-right">
+                {!cat.is_protected && (
+                  <button
+                    className="text-xs text-gray-500 hover:text-red-700"
+                    onClick={() => {
+                      if (confirm(`Delete category "${cat.name}"?`)) onDelete(cat.id);
+                    }}
+                  >
+                    Delete
+                  </button>
+                )}
+              </td>
+            </tr>
+          );
+        })}
+      </tbody>
+      {archived.length > 0 && (
+        <tbody>
+          <tr className="border-t border-gray-200">
+            <td colSpan={6} className="px-3 pt-3 pb-1 text-[10px] uppercase tracking-wide text-gray-400 font-semibold">
+              Archived
+            </td>
+          </tr>
+          {archived
+            .slice()
+            .sort(byName)
+            .map((cat) => (
+              <tr key={cat.id} className="border-t border-gray-100 bg-gray-50/40 text-gray-500">
+                <td className="px-3 py-1.5">
+                  {cat.color && (
+                    <span
+                      className="inline-block w-3.5 h-3.5 rounded-sm opacity-60"
+                      style={{ background: cat.color }}
+                    />
+                  )}
+                </td>
+                <td className="px-3 py-1.5 line-through" colSpan={4}>
+                  {cat.name}
+                </td>
+                <td className="px-3 py-1.5 text-right">
+                  <button
+                    className="text-xs text-gray-500 hover:text-gray-900"
+                    onClick={() => onUpdate({ id: cat.id, archived: false })}
+                  >
+                    Unarchive
+                  </button>
+                </td>
+              </tr>
+            ))}
+        </tbody>
+      )}
+    </table>
+  );
+}
+
+function ColorCell({
+  value,
+  onPick,
+}: {
+  value: string | null;
+  onPick: (color: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="relative">
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        className="w-5 h-5 rounded border border-gray-300 shadow-sm"
+        style={{ background: value ?? "#ffffff" }}
+        title="Change color"
+      />
+      {open && (
+        <>
+          {/* Click-away backdrop */}
+          <div className="fixed inset-0 z-20" onClick={() => setOpen(false)} />
+          <div className="absolute z-30 mt-1 p-2 bg-white border border-gray-200 rounded-lg shadow-xl w-44">
+            <div className="grid grid-cols-6 gap-1.5">
+              {CATEGORY_COLORS.map((c) => (
+                <button
+                  key={c}
+                  type="button"
+                  onClick={() => {
+                    onPick(c);
+                    setOpen(false);
+                  }}
+                  className={`w-5 h-5 rounded border ${
+                    value === c ? "ring-2 ring-offset-1 ring-gray-900 border-white" : "border-gray-300"
+                  }`}
+                  style={{ background: c }}
+                />
               ))}
-            </ul>
-          )}
-        </li>
-      ))}
-    </ul>
+            </div>
+            <label className="flex items-center gap-2 mt-2 pt-2 border-t border-gray-100 text-xs text-gray-600">
+              Custom
+              <input
+                type="color"
+                value={value ?? "#888888"}
+                onChange={(e) => onPick(e.target.value)}
+                className="w-7 h-6 p-0 border-0 bg-transparent cursor-pointer"
+              />
+            </label>
+          </div>
+        </>
+      )}
+    </div>
   );
 }
 

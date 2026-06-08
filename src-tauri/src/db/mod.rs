@@ -143,8 +143,8 @@ fn seed_categories(conn: &Connection) -> AppResult<()> {
 fn seed_accounts(conn: &Connection) -> AppResult<()> {
     let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
     let rows: &[(&str, &str)] = &[
-        ("Joint Checking", "checking"),
-        ("Apple Card", "credit"),
+        ("Bank Account", "checking"),
+        ("Credit Card", "credit"),
         ("Savings", "savings"),
     ];
     for (i, (name, kind)) in rows.iter().enumerate() {

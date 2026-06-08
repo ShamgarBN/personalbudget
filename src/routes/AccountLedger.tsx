@@ -1,10 +1,45 @@
-import { useMemo, useState } from "react";
+import { createContext, useContext, useMemo, useState, type ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "@/api";
-import { asTree } from "@/lib/categories";
+import { asTree, makeColorResolver, CategoryColorContext, useCategoryColor } from "@/lib/categories";
 import { ResizableTh, useColumnWidths } from "@/lib/columns";
-import { fmtDate, fmtUSD } from "@/lib/formatting";
+import { fmtDate, fmtUSD, todayISO } from "@/lib/formatting";
+import { projectOccurrences } from "@/lib/recurrence";
+import { useCollapsed } from "@/lib/collapse";
 import type { PayPeriod, Transaction } from "@/api/types";
+
+// A ledger row is either a real transaction or a projected "ghost" occurrence
+// of a recurring transaction (future-dated, editable, forecast-only).
+// Real rows that are credit-card payments carry the charge window so they can
+// expand to show the underlying card charges.
+type LedgerItem = Transaction & {
+  ghostBillId?: number;
+  ccChargesFrom?: string;
+  ccChargesTo?: string;
+};
+const isGhost = (i: LedgerItem): boolean => i.ghostBillId != null;
+
+// Heuristic: is this checking transaction a payment toward the credit card?
+function isCcPayment(t: LedgerItem): boolean {
+  if (t.ghostBillId != null || t.amount >= 0) return false;
+  const d = (t.title ?? t.description ?? "").toUpperCase();
+  return (
+    d.includes("APPLECARD") ||
+    d.includes("CREDIT CARD") ||
+    d.includes("CARD PAYMENT") ||
+    (t.category_name === "Transfer" && d.includes("CARD"))
+  );
+}
+
+// Provides the credit-account id to ledger rows so a payment row can fetch the
+// charges it paid off, without threading the id through every grouping wrapper.
+const CcAccountContext = createContext<number | null>(null);
+
+function addDaysISO(isoDate: string, n: number): string {
+  const d = new Date(isoDate + "T00:00:00");
+  d.setDate(d.getDate() + n);
+  return d.toISOString().slice(0, 10);
+}
 
 type RangeMode =
   | { kind: "all" }
@@ -40,6 +75,7 @@ export default function AccountLedger({
   halfMonthCollapse = false,
   showPinnedCcPayment = false,
   showCcStartingBalance = false,
+  showProjections = false,
   defaultRange = "month",
 }: {
   accountKind: "checking" | "credit" | "savings";
@@ -49,6 +85,9 @@ export default function AccountLedger({
   /// When true (Bank Account tab), also show an editor for the credit card
   /// account's opening balance inside the starting-balances section.
   showCcStartingBalance?: boolean;
+  /// When true (Bank Account tab), project recurring transactions forward as
+  /// editable "ghost" rows that extend the running balance as a forecast.
+  showProjections?: boolean;
   defaultRange?: "all" | "month";
 }) {
   const qc = useQueryClient();
@@ -92,6 +131,7 @@ export default function AccountLedger({
   const accounts = useQuery({ queryKey: ["accounts"], queryFn: api.listAccounts });
   const categories = useQuery({ queryKey: ["categories"], queryFn: api.listCategories });
   const categoryTree = useMemo(() => asTree(categories.data ?? []), [categories.data]);
+  const colorOf = useMemo(() => makeColorResolver(categories.data ?? []), [categories.data]);
 
   const account = useMemo(
     () => (accounts.data ?? []).find((a) => a.kind === accountKind),
@@ -171,13 +211,103 @@ export default function AccountLedger({
     return baseline + ccCurrentBalance;
   }, [rows, ccCurrentBalance]);
 
+  // Recurring transactions for this account, projected forward as editable
+  // "ghost" rows (Bank Account only). They extend the running balance as a
+  // forecast and can be locked in (materialized) by editing or clearing.
+  const bills = useQuery({ queryKey: ["recurring-bills"], queryFn: api.listRecurringBills });
+  const catNameById = useMemo(() => {
+    const m = new Map<number, string>();
+    for (const c of categories.data ?? []) m.set(c.id, c.name);
+    return m;
+  }, [categories.data]);
+
+  const ghosts: LedgerItem[] = useMemo(() => {
+    if (!showProjections || !account) return [];
+    const t = todayISO();
+    const afterToday = addDaysISO(t, 1);
+    const horizon = addDaysISO(t, 730); // 2-year forecast
+    const startISO = range.from > afterToday ? range.from : afterToday;
+    const endISO = range.to < horizon ? range.to : horizon;
+    if (startISO > endISO) return [];
+    // Skip occurrences already locked in (a real txn carries from_bill_id).
+    const materialized = new Set(
+      rows.filter((r) => r.from_bill_id != null).map((r) => `${r.from_bill_id}:${r.date}`),
+    );
+    const occ = projectOccurrences(bills.data ?? [], startISO, endISO).filter(
+      (o) => o.account_id === account.id && !materialized.has(`${o.bill_id}:${o.date}`),
+    );
+    // Forecast running balance threads forward from today's actual balance.
+    let run = account.current_balance;
+    return occ.map((o, i) => {
+      run += o.amount;
+      return {
+        id: -1 - i,
+        account_id: o.account_id,
+        date: o.date,
+        description: o.name,
+        title: null,
+        category_id: o.category_id,
+        category_name: o.category_id != null ? catNameById.get(o.category_id) ?? null : null,
+        amount: o.amount,
+        memo: null,
+        cleared: false,
+        flagged: false,
+        needs_review: false,
+        split_of_id: null,
+        from_bill_id: o.bill_id,
+        running_balance: run,
+        ghostBillId: o.bill_id,
+      };
+    });
+  }, [showProjections, account, range.from, range.to, rows, bills.data, catNameById]);
+
+  // Real rows + ghosts, ASC by date (real before ghost on the same day).
+  // Real rows are cloned so we can safely tag credit-card payments with the
+  // charge window they cover (never mutate react-query's cached objects).
+  const items: LedgerItem[] = useMemo(() => {
+    const merged: LedgerItem[] = [...rows.map((r) => ({ ...r })), ...ghosts];
+    merged.sort(
+      (a, b) =>
+        a.date.localeCompare(b.date) ||
+        (isGhost(a) ? 1 : 0) - (isGhost(b) ? 1 : 0) ||
+        a.id - b.id,
+    );
+    // Tag each credit-card payment with the window of charges it pays off:
+    // (previous payment date, this payment date].
+    if (showPinnedCcPayment && creditAccount) {
+      let lastPay = account?.opening_date ?? "1900-01-01";
+      for (const it of merged) {
+        if (isGhost(it)) continue;
+        if (isCcPayment(it)) {
+          it.ccChargesFrom = lastPay === (account?.opening_date ?? "1900-01-01") ? lastPay : addDaysISO(lastPay, 1);
+          it.ccChargesTo = it.date;
+          lastPay = it.date;
+        }
+      }
+    }
+    return merged;
+  }, [rows, ghosts, showPinnedCcPayment, creditAccount, account]);
+
+  const materialize = useMutation({
+    mutationFn: (a: { billId: number; date: string; amount: number; cleared: boolean }) =>
+      api.materializeOccurrence(a),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["transactions"] });
+      qc.invalidateQueries({ queryKey: ["accounts"] });
+      qc.invalidateQueries({ queryKey: ["dashboard"] });
+    },
+  });
+  const onMaterialize = (billId: number, date: string, amount: number, cleared: boolean) =>
+    materialize.mutate({ billId, date, amount, cleared });
+
   // When pay-period grouping is on, fetch the periods that overlap the
   // visible range. Using the displayed-row span (rather than range.from/to)
   // keeps the query stable when an "all time" view has no rows yet.
   const ppRange = useMemo(() => {
-    if (!groupByPP || rows.length === 0) return null;
-    return { from: rows[0].date, to: rows[rows.length - 1].date };
-  }, [groupByPP, rows]);
+    if (!groupByPP || items.length === 0) return null;
+    // Span includes ghost dates so the generated periods reach into the future.
+    return { from: items[0].date, to: items[items.length - 1].date };
+  }, [groupByPP, items]);
   const payPeriods = useQuery({
     queryKey: ["pay-periods", "account-ledger", ppRange?.from, ppRange?.to],
     queryFn: () => api.generatePayPeriods(ppRange!.from, ppRange!.to),
@@ -186,13 +316,13 @@ export default function AccountLedger({
 
   const groupedPP = useMemo(() => {
     if (!groupByPP || !payPeriods.data) return null;
-    const buckets: Array<{ period: PayPeriod; rows: Transaction[] }> =
-      payPeriods.data.map((p) => ({ period: p, rows: [] as Transaction[] }));
-    const orphans: Transaction[] = [];
-    // Both rows and buckets are sorted ASC by date — single pass with a
-    // moving pointer avoids O(rows × periods). PayPeriod.end is exclusive.
+    const buckets: Array<{ period: PayPeriod; rows: LedgerItem[] }> =
+      payPeriods.data.map((p) => ({ period: p, rows: [] as LedgerItem[] }));
+    const orphans: LedgerItem[] = [];
+    // Both items and buckets are sorted ASC by date — single pass with a
+    // moving pointer avoids O(items × periods). PayPeriod.end is exclusive.
     let pi = 0;
-    for (const r of rows) {
+    for (const r of items) {
       while (pi < buckets.length && r.date >= buckets[pi].period.end) pi++;
       if (pi < buckets.length && r.date >= buckets[pi].period.start) {
         buckets[pi].rows.push(r);
@@ -201,29 +331,29 @@ export default function AccountLedger({
       }
     }
     return { buckets: buckets.filter((b) => b.rows.length > 0), orphans };
-  }, [groupByPP, payPeriods.data, rows]);
+  }, [groupByPP, payPeriods.data, items]);
 
   const groupedHalves = useMemo(() => {
     // Pay-period grouping wins when both are eligible.
     if (groupedPP) return null;
     if (!halfMonthCollapse || mode.kind !== "month") return null;
-    const firstHalf: Transaction[] = [];
-    const secondHalf: Transaction[] = [];
-    for (const r of rows) {
+    const firstHalf: LedgerItem[] = [];
+    const secondHalf: LedgerItem[] = [];
+    for (const r of items) {
       const day = new Date(r.date + "T00:00:00").getDate();
       (day <= 15 ? firstHalf : secondHalf).push(r);
     }
     return { firstHalf, secondHalf };
-  }, [halfMonthCollapse, mode, rows, groupedPP]);
+  }, [halfMonthCollapse, mode, items, groupedPP]);
 
   return (
+    <CategoryColorContext.Provider value={colorOf}>
+    <CcAccountContext.Provider value={showPinnedCcPayment ? creditAccount?.id ?? null : null}>
     <div className="p-6 space-y-4 text-gray-900">
       <div className="flex items-end justify-between flex-wrap gap-3">
         <div>
           <h1 className="text-2xl font-semibold text-gray-900">{title}</h1>
-          <p className="text-xs text-gray-700 mt-1">
-            {account ? account.name : "—"} · {range.label}
-          </p>
+          <p className="text-xs text-gray-700 mt-1">{range.label}</p>
         </div>
         <div className="flex items-center gap-1.5 text-sm flex-wrap">
           <button
@@ -399,7 +529,7 @@ export default function AccountLedger({
               </tr>
             </thead>
             {(() => {
-              if (rows.length === 0) {
+              if (items.length === 0) {
                 return (
                   <tbody>
                     {!txns.isLoading && (
@@ -445,27 +575,60 @@ export default function AccountLedger({
                 // Display order is ASC, so the last bucket is the most recent
                 // pay period. Default-open only that one to keep the mount
                 // cost flat across "all time" views.
-                const lastIdx = groupedPP.buckets.length - 1;
+                const lastBucket = groupedPP.buckets[groupedPP.buckets.length - 1];
+                const curYear = todayISO().slice(0, 4);
+                // Group the pay-period buckets by calendar year (buckets are ASC).
+                const years: Array<{ year: string; buckets: typeof groupedPP.buckets }> = [];
+                for (const b of groupedPP.buckets) {
+                  const y = b.period.start.slice(0, 4);
+                  let g = years.find((x) => x.year === y);
+                  if (!g) {
+                    g = { year: y, buckets: [] };
+                    years.push(g);
+                  }
+                  g.buckets.push(b);
+                }
                 return (
                   <>
-                    {groupedPP.buckets.map((bucket, i) => (
-                      <PeriodBody
-                        key={bucket.period.start}
-                        label={bucket.period.label}
-                        rows={bucket.rows}
-                        categories={categoryTree}
-                        onUpdate={(args) => update.mutate(args)}
-                        onDelete={(id) => del.mutate(id)}
-                        defaultOpen={i === lastIdx}
-                      />
-                    ))}
+                    {years.map((yg) => {
+                      const yearTotal = yg.buckets.reduce(
+                        (s, b) => s + b.rows.reduce((ss, r) => ss + r.amount, 0),
+                        0,
+                      );
+                      return (
+                        <YearGroup
+                          key={yg.year}
+                          year={yg.year}
+                          total={yearTotal}
+                          colSpan={7}
+                          groupKey={`acct:${accountKind}:year:${yg.year}`}
+                          defaultOpen={yg.year === curYear}
+                        >
+                          {yg.buckets.map((bucket) => (
+                            <PeriodBody
+                              key={bucket.period.start}
+                              label={bucket.period.label}
+                              rows={bucket.rows}
+                              categories={categoryTree}
+                              groupKey={`acct:${accountKind}:pp:${bucket.period.start}`}
+                              onUpdate={(args) => update.mutate(args)}
+                              onDelete={(id) => del.mutate(id)}
+                              onMaterialize={onMaterialize}
+                              defaultOpen={bucket === lastBucket}
+                            />
+                          ))}
+                        </YearGroup>
+                      );
+                    })}
                     {groupedPP.orphans.length > 0 && (
                       <PeriodBody
                         label={`Outside any pay period (${groupedPP.orphans.length})`}
                         rows={groupedPP.orphans}
                         categories={categoryTree}
+                        groupKey={`acct:${accountKind}:pp:orphans`}
                         onUpdate={(args) => update.mutate(args)}
                         onDelete={(id) => del.mutate(id)}
+                        onMaterialize={onMaterialize}
                         defaultOpen={false}
                       />
                     )}
@@ -479,28 +642,33 @@ export default function AccountLedger({
                       label={`Days 1 – 15 (${groupedHalves.firstHalf.length})`}
                       rows={groupedHalves.firstHalf}
                       categories={categoryTree}
+                      groupKey={`acct:${accountKind}:half1:${range.from}`}
                       onUpdate={(args) => update.mutate(args)}
                       onDelete={(id) => del.mutate(id)}
+                      onMaterialize={onMaterialize}
                     />
                     <HalfBody
                       label={`Days 16 – end of month (${groupedHalves.secondHalf.length})`}
                       rows={groupedHalves.secondHalf}
                       categories={categoryTree}
+                      groupKey={`acct:${accountKind}:half2:${range.from}`}
                       onUpdate={(args) => update.mutate(args)}
                       onDelete={(id) => del.mutate(id)}
+                      onMaterialize={onMaterialize}
                     />
                   </>
                 );
               }
               return (
                 <tbody>
-                  {rows.map((t) => (
+                  {items.map((t) => (
                     <LedgerRow
                       key={t.id}
                       t={t}
                       categories={categoryTree}
                       onUpdate={(args) => update.mutate(args)}
                       onDelete={(id) => del.mutate(id)}
+                      onMaterialize={onMaterialize}
                     />
                   ))}
                 </tbody>
@@ -529,6 +697,51 @@ export default function AccountLedger({
         </div>
       )}
     </div>
+    </CcAccountContext.Provider>
+    </CategoryColorContext.Provider>
+  );
+}
+
+// Collapsible year wrapper: a header tbody followed (when open) by its
+// pay-period tbodies. Rendered as a fragment so the period <tbody>s remain
+// siblings (a tbody can't contain tbodies).
+function YearGroup({
+  year,
+  total,
+  groupKey,
+  colSpan,
+  defaultOpen,
+  children,
+}: {
+  year: string;
+  total: number;
+  groupKey: string;
+  colSpan: number;
+  defaultOpen: boolean;
+  children: ReactNode;
+}) {
+  const [open, toggle] = useCollapsed(groupKey, defaultOpen);
+  return (
+    <>
+      <tbody>
+        <tr className="bg-gray-100 border-y border-gray-300">
+          <td colSpan={colSpan - 1} className="px-3 py-2 text-sm font-semibold text-gray-900">
+            <button type="button" onClick={toggle} className="flex items-center gap-2 hover:text-black">
+              <span className="inline-block w-3">{open ? "▾" : "▸"}</span>
+              {year}
+            </button>
+          </td>
+          <td
+            className={`px-3 py-2 text-right text-sm font-semibold tabular-nums ${
+              total < 0 ? "text-red-700" : "text-green-700"
+            }`}
+          >
+            {fmtUSD(total)}
+          </td>
+        </tr>
+      </tbody>
+      {open && children}
+    </>
   );
 }
 
@@ -536,18 +749,22 @@ function PeriodBody({
   label,
   rows,
   categories,
+  groupKey,
   onUpdate,
   onDelete,
+  onMaterialize,
   defaultOpen = true,
 }: {
   label: string;
-  rows: Transaction[];
+  rows: LedgerItem[];
   categories: ReturnType<typeof asTree>;
+  groupKey: string;
   onUpdate: (args: Parameters<typeof api.updateTransaction>[0]) => void;
   onDelete: (id: number) => void;
+  onMaterialize: (billId: number, date: string, amount: number, cleared: boolean) => void;
   defaultOpen?: boolean;
 }) {
-  const [open, setOpen] = useState(defaultOpen);
+  const [open, toggle] = useCollapsed(groupKey, defaultOpen);
   const total = rows.reduce((s, r) => s + r.amount, 0);
   return (
     <tbody>
@@ -555,7 +772,7 @@ function PeriodBody({
         <td colSpan={4} className="px-3 py-1.5 text-xs font-semibold text-gray-800 uppercase tracking-wide">
           <button
             type="button"
-            onClick={() => setOpen((o) => !o)}
+            onClick={toggle}
             className="flex items-center gap-2 hover:text-black"
           >
             <span className="inline-block w-3">{open ? "▾" : "▸"}</span>
@@ -576,6 +793,7 @@ function PeriodBody({
             categories={categories}
             onUpdate={onUpdate}
             onDelete={onDelete}
+            onMaterialize={onMaterialize}
           />
         ))}
     </tbody>
@@ -586,16 +804,20 @@ function HalfBody({
   label,
   rows,
   categories,
+  groupKey,
   onUpdate,
   onDelete,
+  onMaterialize,
 }: {
   label: string;
-  rows: Transaction[];
+  rows: LedgerItem[];
   categories: ReturnType<typeof asTree>;
+  groupKey: string;
   onUpdate: (args: Parameters<typeof api.updateTransaction>[0]) => void;
   onDelete: (id: number) => void;
+  onMaterialize: (billId: number, date: string, amount: number, cleared: boolean) => void;
 }) {
-  const [open, setOpen] = useState(true);
+  const [open, toggle] = useCollapsed(groupKey, true);
   const total = rows.reduce((s, r) => s + r.amount, 0);
   return (
     <tbody>
@@ -603,7 +825,7 @@ function HalfBody({
         <td colSpan={4} className="px-3 py-1.5 text-xs font-semibold text-gray-800 uppercase tracking-wide">
           <button
             type="button"
-            onClick={() => setOpen((o) => !o)}
+            onClick={toggle}
             className="flex items-center gap-2 hover:text-black"
           >
             <span className="inline-block w-3">{open ? "▾" : "▸"}</span>
@@ -624,6 +846,7 @@ function HalfBody({
             categories={categories}
             onUpdate={onUpdate}
             onDelete={onDelete}
+            onMaterialize={onMaterialize}
           />
         ))}
       {open && rows.length === 0 && (
@@ -642,36 +865,127 @@ function LedgerRow({
   categories,
   onUpdate,
   onDelete,
+  onMaterialize,
 }: {
-  t: Transaction;
+  t: LedgerItem;
   categories: ReturnType<typeof asTree>;
   onUpdate: (args: Parameters<typeof api.updateTransaction>[0]) => void;
   onDelete: (id: number) => void;
+  onMaterialize: (billId: number, date: string, amount: number, cleared: boolean) => void;
 }) {
+  const colorOf = useCategoryColor();
+  const creditAccountId = useContext(CcAccountContext);
+  const [expanded, setExpanded] = useState(false);
+  const isCcPay =
+    t.ghostBillId == null &&
+    t.ccChargesFrom != null &&
+    t.ccChargesTo != null &&
+    creditAccountId != null;
+  const charges = useQuery({
+    queryKey: ["cc-charges", creditAccountId, t.ccChargesFrom, t.ccChargesTo, t.id],
+    queryFn: () =>
+      api.listTransactions({
+        account_id: creditAccountId!,
+        date_from: t.ccChargesFrom!,
+        date_to: t.ccChargesTo!,
+        limit: 500,
+      }),
+    enabled: isCcPay && expanded,
+  });
+  const chargeRows = (charges.data?.rows ?? []).filter((c) => c.amount < 0);
+  const chargeTotal = chargeRows.reduce((s, c) => s + c.amount, 0);
+  // Projected (ghost) occurrence of a recurring transaction: faint, editable
+  // amount, and a "lock in" action. Editing the amount or clicking the check
+  // materializes this one occurrence into a real transaction.
+  if (t.ghostBillId != null) {
+    const billId = t.ghostBillId;
+    return (
+      <tr className="border-t border-dashed border-gray-200 bg-blue-50/20 text-gray-500 italic">
+        <td className="px-3 py-1.5 whitespace-nowrap truncate">{fmtDate(t.date)}</td>
+        <td className="px-3 py-1.5 truncate">
+          <span className="line-clamp-1" title={t.description}>
+            {t.description}
+          </span>
+          <span className="ml-1.5 not-italic text-[9px] uppercase tracking-wide text-blue-600/70 align-middle">
+            scheduled
+          </span>
+        </td>
+        <td className="px-3 py-1.5 text-gray-400">—</td>
+        <td className="px-3 py-1.5">
+          <div className="flex items-center gap-1.5">
+            <span
+              className="inline-block w-2 h-2 rounded-sm shrink-0"
+              style={{ background: colorOf(t.category_id) ?? "transparent" }}
+            />
+            <span className="text-xs truncate not-italic text-gray-600">
+              {t.category_name ?? "(uncategorized)"}
+            </span>
+          </div>
+        </td>
+        <td className={`px-3 py-1.5 text-right tabular-nums ${t.amount < 0 ? "text-red-600/80" : "text-green-700/80"}`}>
+          <GhostAmount
+            value={t.amount}
+            onCommit={(amount) => onMaterialize(billId, t.date, amount, false)}
+          />
+        </td>
+        <td className="px-3 py-1.5 text-right tabular-nums text-gray-400 truncate">
+          {t.running_balance != null ? fmtUSD(t.running_balance) : ""}
+        </td>
+        <td className="px-3 py-1.5 text-right whitespace-nowrap">
+          <button
+            title="Mark cleared & lock this occurrence in"
+            onClick={() => onMaterialize(billId, t.date, t.amount, true)}
+            className="text-xs not-italic text-gray-500 hover:text-green-700"
+          >
+            ✓ Lock in
+          </button>
+        </td>
+      </tr>
+    );
+  }
   return (
+    <>
     <tr className={`border-t border-gray-100 hover:bg-gray-50 ${t.flagged ? "ring-1 ring-amber-300/40" : ""}`}>
       <td className="px-3 py-1.5 whitespace-nowrap text-gray-800 truncate">{fmtDate(t.date)}</td>
       <td className="px-3 py-1.5 truncate">
-        <span className="line-clamp-1" title={t.description}>{t.title ?? t.description}</span>
+        <span className="flex items-center gap-1">
+          {isCcPay && (
+            <button
+              type="button"
+              onClick={() => setExpanded((o) => !o)}
+              className="text-gray-400 hover:text-gray-700 shrink-0"
+              title="Show the card charges this payment covers"
+            >
+              <span className="inline-block w-3">{expanded ? "▾" : "▸"}</span>
+            </button>
+          )}
+          <span className="line-clamp-1" title={t.description}>{t.title ?? t.description}</span>
+        </span>
       </td>
       <td className="px-3 py-1.5">
         <MemoCell value={t.memo} onSave={(v) => onUpdate({ id: t.id, memo: v })} />
       </td>
       <td className="px-3 py-1.5">
-        <select
-          className="border border-gray-200 rounded px-1.5 py-0.5 text-xs bg-white w-full"
-          value={t.category_id ?? ""}
-          onChange={(e) =>
-            onUpdate({ id: t.id, categoryId: e.target.value ? Number(e.target.value) : null })
-          }
-        >
-          <option value="">(uncategorized)</option>
-          {categories.map((c) => (
-            <option key={c.id} value={c.id}>
-              {c.label}
-            </option>
-          ))}
-        </select>
+        <div className="flex items-center gap-1.5">
+          <span
+            className="inline-block w-2 h-2 rounded-sm shrink-0"
+            style={{ background: colorOf(t.category_id) ?? "transparent" }}
+          />
+          <select
+            className="border border-gray-200 rounded px-1.5 py-0.5 text-xs bg-white w-full"
+            value={t.category_id ?? ""}
+            onChange={(e) =>
+              onUpdate({ id: t.id, categoryId: e.target.value ? Number(e.target.value) : null })
+            }
+          >
+            <option value="">(uncategorized)</option>
+            {categories.map((c) => (
+              <option key={c.id} value={c.id}>
+                {c.label}
+              </option>
+            ))}
+          </select>
+        </div>
       </td>
       <td className={`px-3 py-1.5 text-right tabular-nums truncate ${t.amount < 0 ? "text-red-700" : "text-green-700"}`}>
         {fmtUSD(t.amount)}
@@ -690,6 +1004,49 @@ function LedgerRow({
         </button>
       </td>
     </tr>
+    {isCcPay && expanded && (
+      <>
+        {charges.isLoading && (
+          <tr className="bg-gray-50/60">
+            <td colSpan={7} className="px-3 py-2 pl-10 text-xs text-gray-500">
+              Loading card charges…
+            </td>
+          </tr>
+        )}
+        {!charges.isLoading && chargeRows.length === 0 && (
+          <tr className="bg-gray-50/60">
+            <td colSpan={7} className="px-3 py-2 pl-10 text-xs text-gray-500 italic">
+              No card charges found between {fmtDate(t.ccChargesFrom!)} and {fmtDate(t.ccChargesTo!)}.
+            </td>
+          </tr>
+        )}
+        {chargeRows.map((c) => (
+          <tr key={`cc-${c.id}`} className="bg-gray-50/60 text-xs text-gray-600">
+            <td className="px-3 py-1 pl-10 whitespace-nowrap">{fmtDate(c.date)}</td>
+            <td className="px-3 py-1 truncate" colSpan={3}>
+              <span className="line-clamp-1" title={c.description}>{c.title ?? c.description}</span>
+            </td>
+            <td className="px-3 py-1 text-right tabular-nums text-red-700">{fmtUSD(c.amount)}</td>
+            <td className="px-3 py-1" />
+            <td className="px-3 py-1 text-right text-[10px] text-gray-400 italic whitespace-nowrap">
+              on Credit Card
+            </td>
+          </tr>
+        ))}
+        {chargeRows.length > 0 && (
+          <tr className="bg-gray-50 text-xs border-b border-gray-200">
+            <td colSpan={4} className="px-3 py-1 pl-10 text-gray-500">
+              {chargeRows.length} charge{chargeRows.length === 1 ? "" : "s"} · already counted once via the payment above
+            </td>
+            <td className="px-3 py-1 text-right tabular-nums font-medium text-gray-700">
+              {fmtUSD(chargeTotal)}
+            </td>
+            <td colSpan={2} />
+          </tr>
+        )}
+      </>
+    )}
+    </>
   );
 }
 
@@ -727,6 +1084,50 @@ function MemoCell({ value, onSave }: { value: string | null; onSave: (v: string 
           setDraft(value ?? "");
           setEditing(false);
         }
+      }}
+    />
+  );
+}
+
+// Editable amount for a projected ghost row. Editing commits (materializes)
+// the occurrence with the entered magnitude, preserving the expense/income sign.
+function GhostAmount({ value, onCommit }: { value: number; onCommit: (n: number) => void }) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(Math.abs(value).toFixed(2));
+  if (!editing) {
+    return (
+      <span
+        className="cursor-text"
+        onDoubleClick={() => {
+          setDraft(Math.abs(value).toFixed(2));
+          setEditing(true);
+        }}
+        title="Double-click to set the actual amount (locks it in)"
+      >
+        {fmtUSD(value)}
+      </span>
+    );
+  }
+  const sign = value < 0 ? -1 : 1;
+  return (
+    <input
+      autoFocus
+      type="number"
+      step="0.01"
+      className="w-24 border rounded px-1 py-0.5 text-sm bg-white text-right tabular-nums not-italic"
+      value={draft}
+      onChange={(e) => setDraft(e.target.value)}
+      onBlur={() => {
+        setEditing(false);
+        const mag = parseFloat(draft);
+        if (!Number.isNaN(mag)) {
+          const signed = sign * Math.abs(mag);
+          if (signed !== value) onCommit(signed);
+        }
+      }}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+        if (e.key === "Escape") setEditing(false);
       }}
     />
   );

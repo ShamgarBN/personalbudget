@@ -93,7 +93,8 @@ pub fn run(conn: &Connection, args: ForecastArgs) -> AppResult<ForecastResult> {
         for b in &bills {
             if bill_hits_on(b, cursor, today) {
                 if let Some(bal) = running.get_mut(&b.account_id) {
-                    *bal -= b.amount.abs();
+                    // amount is signed: negative = expense, positive = income.
+                    *bal += b.amount;
                 }
             }
         }
@@ -214,13 +215,14 @@ struct Bill {
     pub cadence_kind: String,
     pub day_of_month: Option<i64>,
     pub anchor_date: Option<String>,
+    pub interval_days: Option<i64>,
     pub start_date: Option<String>,
     pub end_date: Option<String>,
 }
 
 fn load_recurring_bills(conn: &Connection) -> AppResult<Vec<Bill>> {
     let mut stmt = conn.prepare(
-        "SELECT account_id, amount, cadence_kind, day_of_month, anchor_date, start_date, end_date \
+        "SELECT account_id, amount, cadence_kind, day_of_month, anchor_date, interval_days, start_date, end_date \
          FROM recurring_bill WHERE active = 1",
     )?;
     let rows = stmt
@@ -231,8 +233,9 @@ fn load_recurring_bills(conn: &Connection) -> AppResult<Vec<Bill>> {
                 cadence_kind: r.get(2)?,
                 day_of_month: r.get(3)?,
                 anchor_date: r.get(4)?,
-                start_date: r.get(5)?,
-                end_date: r.get(6)?,
+                interval_days: r.get(5)?,
+                start_date: r.get(6)?,
+                end_date: r.get(7)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -277,6 +280,22 @@ fn bill_hits_on(bill: &Bill, on: NaiveDate, from: NaiveDate) -> bool {
             .as_deref()
             .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
             .map_or(false, |a| (on - a).num_days() % 14 == 0),
+        "custom_days" => {
+            // Every interval_days from the anchor (start_date is mirrored into
+            // anchor_date on save). Guards against a zero/None interval.
+            let step = bill.interval_days.unwrap_or(0);
+            if step <= 0 {
+                return false;
+            }
+            bill.anchor_date
+                .as_deref()
+                .or(bill.start_date.as_deref())
+                .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
+                .map_or(false, |a| {
+                    let diff = (on - a).num_days();
+                    diff >= 0 && diff % step == 0
+                })
+        }
         _ => false,
     }
 }
@@ -411,8 +430,11 @@ fn build_pay_period_projections(
         let mut day = proj_from;
         while day < end {
             for b in bills {
-                if bill_hits_on(b, day, proj_from) {
-                    projected_bills += b.amount.abs();
+                // Only expense recurring transactions (negative) count toward
+                // projected bills; income recurring is captured by the income
+                // projection separately.
+                if b.amount < 0.0 && bill_hits_on(b, day, proj_from) {
+                    projected_bills += -b.amount;
                 }
             }
             day += Duration::days(1);

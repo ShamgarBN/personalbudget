@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "@/api";
-import { asTree } from "@/lib/categories";
+import { asTree, makeColorResolver, type ColorResolver } from "@/lib/categories";
 import { ResizableTh, useColumnWidths } from "@/lib/columns";
 import { fmtDate, fmtUSD } from "@/lib/formatting";
 import type { Transaction } from "@/api/types";
@@ -16,6 +16,7 @@ export default function AccountSavings() {
   const accounts = useQuery({ queryKey: ["accounts"], queryFn: api.listAccounts });
   const categories = useQuery({ queryKey: ["categories"], queryFn: api.listCategories });
   const categoryTree = useMemo(() => asTree(categories.data ?? []), [categories.data]);
+  const colorOf = useMemo(() => makeColorResolver(categories.data ?? []), [categories.data]);
 
   const account = useMemo(
     () => (accounts.data ?? []).find((a) => a.kind === "savings"),
@@ -131,6 +132,7 @@ export default function AccountSavings() {
                 key={t.id}
                 t={t}
                 categories={categoryTree}
+                colorOf={colorOf}
                 onUpdate={(args) => update.mutate(args)}
                 onDelete={(id) => del.mutate(id)}
               />
@@ -152,11 +154,13 @@ export default function AccountSavings() {
 function SavingsRow({
   t,
   categories,
+  colorOf,
   onUpdate,
   onDelete,
 }: {
   t: Transaction;
   categories: ReturnType<typeof asTree>;
+  colorOf: ColorResolver;
   onUpdate: (args: Parameters<typeof api.updateTransaction>[0]) => void;
   onDelete: (id: number) => void;
 }) {
@@ -170,20 +174,26 @@ function SavingsRow({
         <MemoCell value={t.memo} onSave={(v) => onUpdate({ id: t.id, memo: v })} />
       </td>
       <td className="px-3 py-1.5">
-        <select
-          className="border border-gray-200 rounded px-1.5 py-0.5 text-xs bg-white w-full"
-          value={t.category_id ?? ""}
-          onChange={(e) =>
-            onUpdate({ id: t.id, categoryId: e.target.value ? Number(e.target.value) : null })
-          }
-        >
-          <option value="">(uncategorized)</option>
-          {categories.map((c) => (
-            <option key={c.id} value={c.id}>
-              {c.label}
-            </option>
-          ))}
-        </select>
+        <div className="flex items-center gap-1.5">
+          <span
+            className="inline-block w-2 h-2 rounded-sm shrink-0"
+            style={{ background: colorOf(t.category_id) ?? "transparent" }}
+          />
+          <select
+            className="border border-gray-200 rounded px-1.5 py-0.5 text-xs bg-white w-full"
+            value={t.category_id ?? ""}
+            onChange={(e) =>
+              onUpdate({ id: t.id, categoryId: e.target.value ? Number(e.target.value) : null })
+            }
+          >
+            <option value="">(uncategorized)</option>
+            {categories.map((c) => (
+              <option key={c.id} value={c.id}>
+                {c.label}
+              </option>
+            ))}
+          </select>
+        </div>
       </td>
       <td className={`px-3 py-1.5 text-right tabular-nums truncate ${t.amount < 0 ? "text-red-700" : "text-green-700"}`}>
         {fmtUSD(t.amount)}

@@ -1,11 +1,13 @@
 import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "@/api";
-import { asTree } from "@/lib/categories";
+import { asTree, makeColorResolver } from "@/lib/categories";
+import { useCollapsed } from "@/lib/collapse";
 import { ResizableTh, useColumnWidths } from "@/lib/columns";
-import { fmtDate, fmtUSD } from "@/lib/formatting";
+import { fmtDate, fmtUSD, todayISO } from "@/lib/formatting";
 import type { PayPeriod, Transaction, TxnFilter } from "@/api/types";
 import SplitModal from "@/components/SplitModal";
+import ImportModal from "@/routes/Import";
 
 export default function Ledger() {
   const qc = useQueryClient();
@@ -52,9 +54,11 @@ export default function Ledger() {
     [accounts.data],
   );
   const categoryTree = useMemo(() => asTree(categories.data ?? []), [categories.data]);
+  const colorOf = useMemo(() => makeColorResolver(categories.data ?? []), [categories.data]);
   const { widthOf, startResize } = useColumnWidths();
 
   const [splitTarget, setSplitTarget] = useState<Transaction | null>(null);
+  const [importOpen, setImportOpen] = useState(false);
   // Default on. Without grouping, every one of the ~50K rows mounts into a
   // single flat tbody, and toggling grouping on later has to unmount+remount
   // every stateful inline editor — that's what froze the UI on click.
@@ -104,8 +108,19 @@ export default function Ledger() {
     <div className="p-6 space-y-4">
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-semibold">Ledger</h1>
-        <div className="text-sm text-gray-500">
-          {txns.data ? `${txns.data.total.toLocaleString()} transactions` : null}
+        <div className="flex items-center gap-3">
+          {txns.data && (
+            <span className="text-sm text-gray-500">
+              {txns.data.total.toLocaleString()} transactions
+            </span>
+          )}
+          <button
+            onClick={() => setImportOpen(true)}
+            className="px-3 py-1.5 text-sm rounded-md bg-gray-900 text-white hover:bg-gray-800"
+            title="Import a CSV — or just drop one anywhere on this page"
+          >
+            Import CSV
+          </button>
         </div>
       </div>
 
@@ -223,23 +238,29 @@ export default function Ledger() {
                     />
                   </td>
                   <td className="px-3 py-1.5">
-                    <select
-                      className="border rounded px-1.5 py-0.5 text-xs bg-white"
-                      value={t.category_id ?? ""}
-                      onChange={(e) =>
-                        update.mutate({
-                          id: t.id,
-                          categoryId: e.target.value ? Number(e.target.value) : null,
-                        })
-                      }
-                    >
-                      <option value="">(uncategorized)</option>
-                      {categoryTree.map((c) => (
-                        <option key={c.id} value={c.id}>
-                          {c.label}
-                        </option>
-                      ))}
-                    </select>
+                    <div className="flex items-center gap-1.5">
+                      <span
+                        className="inline-block w-2 h-2 rounded-sm shrink-0"
+                        style={{ background: colorOf(t.category_id) ?? "transparent" }}
+                      />
+                      <select
+                        className="border rounded px-1.5 py-0.5 text-xs bg-white"
+                        value={t.category_id ?? ""}
+                        onChange={(e) =>
+                          update.mutate({
+                            id: t.id,
+                            categoryId: e.target.value ? Number(e.target.value) : null,
+                          })
+                        }
+                      >
+                        <option value="">(uncategorized)</option>
+                        {categoryTree.map((c) => (
+                          <option key={c.id} value={c.id}>
+                            {c.label}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
                   </td>
                   <td
                     className={`px-3 py-1.5 text-right tabular-nums ${t.amount < 0 ? "text-red-600" : t.amount > 0 ? "text-green-700" : "text-gray-400"}`}
@@ -305,7 +326,7 @@ export default function Ledger() {
                   {!txns.isLoading && (
                     <tr>
                       <td colSpan={9} className="px-3 py-12 text-center text-sm text-gray-500">
-                        No transactions yet. Drop CSV files in the Import tab to get started.
+                        No transactions yet. Drop a CSV anywhere here (or use Import CSV) to get started.
                       </td>
                     </tr>
                   )}
@@ -345,24 +366,54 @@ export default function Ledger() {
               // recent pay period. Open only that one — opening every group by
               // default would mount tens of thousands of stateful row editors
               // at once and freeze the UI.
-              const lastIdx = grouped.buckets.length - 1;
+              const lastBucket = grouped.buckets[grouped.buckets.length - 1];
+              const curYear = todayISO().slice(0, 4);
+              const years: Array<{ year: string; buckets: typeof grouped.buckets }> = [];
+              for (const b of grouped.buckets) {
+                const y = b.period.start.slice(0, 4);
+                let g = years.find((x) => x.year === y);
+                if (!g) {
+                  g = { year: y, buckets: [] };
+                  years.push(g);
+                }
+                g.buckets.push(b);
+              }
               return (
                 <>
-                  {grouped.buckets.map((bucket, i) => (
-                    <PeriodTbody
-                      key={bucket.period.start}
-                      label={bucket.period.label}
-                      rows={bucket.rows}
-                      colSpan={9}
-                      renderRow={renderRow}
-                      defaultOpen={i === lastIdx}
-                    />
-                  ))}
+                  {years.map((yg) => {
+                    const yearTotal = yg.buckets.reduce(
+                      (s, b) => s + b.rows.reduce((ss, r) => ss + r.amount, 0),
+                      0,
+                    );
+                    return (
+                      <YearTbody
+                        key={yg.year}
+                        year={yg.year}
+                        total={yearTotal}
+                        colSpan={9}
+                        groupKey={`ledger:year:${yg.year}`}
+                        defaultOpen={yg.year === curYear}
+                      >
+                        {yg.buckets.map((bucket) => (
+                          <PeriodTbody
+                            key={bucket.period.start}
+                            label={bucket.period.label}
+                            rows={bucket.rows}
+                            colSpan={9}
+                            groupKey={`ledger:pp:${bucket.period.start}`}
+                            renderRow={renderRow}
+                            defaultOpen={bucket === lastBucket}
+                          />
+                        ))}
+                      </YearTbody>
+                    );
+                  })}
                   {grouped.orphans.length > 0 && (
                     <PeriodTbody
                       label={`Outside any pay period (${grouped.orphans.length})`}
                       rows={grouped.orphans}
                       colSpan={9}
+                      groupKey="ledger:pp:orphans"
                       renderRow={renderRow}
                       defaultOpen={false}
                     />
@@ -380,7 +431,48 @@ export default function Ledger() {
       </div>
 
       {splitTarget && <SplitModal txn={splitTarget} onClose={() => setSplitTarget(null)} />}
+      <ImportModal open={importOpen} onOpenChange={setImportOpen} />
     </div>
+  );
+}
+
+function YearTbody({
+  year,
+  total,
+  colSpan,
+  groupKey,
+  defaultOpen,
+  children,
+}: {
+  year: string;
+  total: number;
+  colSpan: number;
+  groupKey: string;
+  defaultOpen: boolean;
+  children: React.ReactNode;
+}) {
+  const [open, toggle] = useCollapsed(groupKey, defaultOpen);
+  return (
+    <>
+      <tbody>
+        <tr className="bg-gray-100 border-y border-gray-300">
+          <td colSpan={colSpan - 1} className="px-3 py-2 text-sm font-semibold text-gray-900">
+            <button type="button" onClick={toggle} className="flex items-center gap-2 hover:text-black">
+              <span className="inline-block w-3">{open ? "▾" : "▸"}</span>
+              {year}
+            </button>
+          </td>
+          <td
+            className={`px-3 py-2 text-right text-sm font-semibold tabular-nums ${
+              total < 0 ? "text-red-700" : "text-green-700"
+            }`}
+          >
+            {fmtUSD(total)}
+          </td>
+        </tr>
+      </tbody>
+      {open && children}
+    </>
   );
 }
 
@@ -388,16 +480,18 @@ function PeriodTbody({
   label,
   rows,
   colSpan,
+  groupKey,
   renderRow,
   defaultOpen = true,
 }: {
   label: string;
   rows: Transaction[];
   colSpan: number;
+  groupKey: string;
   renderRow: (t: Transaction) => React.ReactNode;
   defaultOpen?: boolean;
 }) {
-  const [open, setOpen] = useState(defaultOpen);
+  const [open, toggle] = useCollapsed(groupKey, defaultOpen);
   const total = rows.reduce((s, r) => s + r.amount, 0);
   return (
     <tbody>
@@ -405,7 +499,7 @@ function PeriodTbody({
         <td colSpan={colSpan - 1} className="px-3 py-1.5 text-xs font-semibold text-gray-800 uppercase tracking-wide">
           <button
             type="button"
-            onClick={() => setOpen((o) => !o)}
+            onClick={toggle}
             className="flex items-center gap-2 hover:text-black"
           >
             <span className="inline-block w-3">{open ? "▾" : "▸"}</span>
