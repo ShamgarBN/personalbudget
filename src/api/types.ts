@@ -36,6 +36,7 @@ export interface Transaction {
   needs_review: boolean;
   split_of_id: number | null;
   from_bill_id: number | null;
+  from_budget_key: string | null;
   running_balance: number | null;
 }
 

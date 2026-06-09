@@ -48,7 +48,7 @@ pub fn list_transactions(state: State<AppState>, filter: Option<TxnFilter>) -> A
            WHERE t.split_of_id IS NULL \
          ) \
          SELECT t.id, t.account_id, t.date, t.description, t.title, t.category_id, c.name, \
-                t.amount, t.memo, t.cleared, t.flagged, t.needs_review, t.split_of_id, t.from_bill_id, r.bal \
+                t.amount, t.memo, t.cleared, t.flagged, t.needs_review, t.split_of_id, t.from_bill_id, t.from_budget_key, r.bal \
          FROM txn t \
          LEFT JOIN category c ON c.id = t.category_id \
          LEFT JOIN running r ON r.id = t.id \
@@ -125,7 +125,8 @@ pub fn list_transactions(state: State<AppState>, filter: Option<TxnFilter>) -> A
                     needs_review: r.get::<_, i64>(11)? != 0,
                     split_of_id: r.get(12)?,
                     from_bill_id: r.get(13)?,
-                    running_balance: r.get(14)?,
+                    from_budget_key: r.get(14)?,
+                    running_balance: r.get(15)?,
                 })
             },
         )?
@@ -395,6 +396,7 @@ fn row_to_txn(r: &rusqlite::Row) -> rusqlite::Result<Transaction> {
         needs_review: r.get::<_, i64>(11)? != 0,
         split_of_id: r.get(12)?,
         from_bill_id: r.get(13)?,
+        from_budget_key: r.get(14)?,
         running_balance: None,
     })
 }
@@ -404,14 +406,14 @@ pub fn get_transaction(state: State<AppState>, id: i64) -> AppResult<TxnWithChil
     let conn = state.conn.lock();
     let parent = conn.query_row(
         "SELECT t.id, t.account_id, t.date, t.description, t.title, t.category_id, c.name, \
-                t.amount, t.memo, t.cleared, t.flagged, t.needs_review, t.split_of_id, t.from_bill_id \
+                t.amount, t.memo, t.cleared, t.flagged, t.needs_review, t.split_of_id, t.from_bill_id, t.from_budget_key \
          FROM txn t LEFT JOIN category c ON c.id=t.category_id WHERE t.id=?",
         rusqlite::params![id],
         row_to_txn,
     )?;
     let mut stmt = conn.prepare(
         "SELECT t.id, t.account_id, t.date, t.description, t.title, t.category_id, c.name, \
-                t.amount, t.memo, t.cleared, t.flagged, t.needs_review, t.split_of_id, t.from_bill_id \
+                t.amount, t.memo, t.cleared, t.flagged, t.needs_review, t.split_of_id, t.from_bill_id, t.from_budget_key \
          FROM txn t LEFT JOIN category c ON c.id=t.category_id \
          WHERE t.split_of_id=? ORDER BY t.id",
     )?;
@@ -453,6 +455,38 @@ pub fn materialize_occurrence(
         "INSERT INTO txn (account_id, date, description, title, category_id, amount, memo, cleared, flagged, needs_review, from_bill_id, created_at, updated_at) \
          VALUES (?, ?, ?, NULL, ?, ?, NULL, ?, 0, 0, ?, ?, ?)",
         rusqlite::params![account_id, date, name, category_id, amount, cleared as i64, bill_id, now, now],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Lock in a projected budget item as a real transaction. Tagged with
+/// `budget_key` ("<categoryId>:<periodStart>") so the ledger stops projecting a
+/// ghost for it; deleting the row reverts to the projection. `amount` is signed.
+#[tauri::command]
+pub fn materialize_budget_item(
+    state: State<AppState>,
+    account_id: i64,
+    category_id: Option<i64>,
+    date: String,
+    amount: f64,
+    description: String,
+    cleared: bool,
+    budget_key: String,
+) -> AppResult<i64> {
+    let conn = state.conn.lock();
+    let existing: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM txn WHERE from_budget_key=?",
+        rusqlite::params![budget_key],
+        |r| r.get(0),
+    )?;
+    if existing > 0 {
+        return Err(AppError::Invalid("budget item already recorded".into()));
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO txn (account_id, date, description, title, category_id, amount, memo, cleared, flagged, needs_review, from_budget_key, created_at, updated_at) \
+         VALUES (?, ?, ?, NULL, ?, ?, NULL, ?, 0, 0, ?, ?, ?)",
+        rusqlite::params![account_id, date, description, category_id, amount, cleared as i64, budget_key, now, now],
     )?;
     Ok(conn.last_insert_rowid())
 }

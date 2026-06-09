@@ -61,8 +61,8 @@ export default function App() {
                   className={({ isActive }) =>
                     `block px-3 py-1.5 text-sm rounded-md transition-colors ${
                       isActive
-                        ? "bg-gray-900 text-white"
-                        : "text-gray-800 hover:bg-gray-200"
+                        ? "bg-gray-200 text-gray-900 font-medium"
+                        : "text-gray-700 hover:bg-gray-100"
                     }`
                   }
                 >

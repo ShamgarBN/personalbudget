@@ -53,7 +53,14 @@ function describeCadence(b: RecurringBill): string {
     }
     return `Every ${n} day${n === 1 ? "" : "s"}`;
   }
-  return b.cadence_kind.charAt(0).toUpperCase() + b.cadence_kind.slice(1);
+  const base = b.cadence_kind.charAt(0).toUpperCase() + b.cadence_kind.slice(1);
+  if (
+    b.day_of_month === -1 &&
+    ["monthly", "quarterly", "semiannual", "annual"].includes(b.cadence_kind)
+  ) {
+    return `${base} · last day`;
+  }
+  return base;
 }
 
 export default function Bills() {
@@ -107,6 +114,8 @@ export default function Bills() {
   // cadence is entered in days or weeks.
   const [billKind, setBillKind] = useState<"expense" | "income">("expense");
   const [customUnit, setCustomUnit] = useState<"days" | "weeks">("days");
+  // Monthly-family recurrence can pin to the last calendar day (day_of_month -1).
+  const [lastDay, setLastDay] = useState(false);
   const openEditor = (b: RecurringBill) => {
     setBillKind(b.amount > 0 ? "income" : "expense");
     setCustomUnit(
@@ -114,6 +123,7 @@ export default function Bills() {
         ? "weeks"
         : "days",
     );
+    setLastDay(b.day_of_month === -1);
     setDraft(b);
   };
 
@@ -290,6 +300,16 @@ export default function Bills() {
                 <option value="custom_days">Custom (every N days/weeks)</option>
               </select>
             </Field>
+            {["monthly", "quarterly", "semiannual", "annual"].includes(draft.cadence_kind) && (
+              <label className="flex items-center gap-2 text-sm text-gray-800">
+                <input
+                  type="checkbox"
+                  checked={lastDay}
+                  onChange={(e) => setLastDay(e.target.checked)}
+                />
+                Recur on the last day of the month
+              </label>
+            )}
             {draft.cadence_kind === "custom_days" && (
               <Field label="Repeat every">
                 <div className="flex items-center gap-2">
@@ -388,7 +408,8 @@ export default function Bills() {
             </div>
             <p className="text-xs text-gray-500">
               It recurs on the start date's day going forward — e.g. start Jun 8, monthly → Jul 8,
-              Aug 8, and so on.
+              Aug 8, and so on. Use “last day of the month” above for paydays like the 15th &amp; end
+              of month.
             </p>
             <label className="flex items-center gap-2 text-sm">
               <input
@@ -414,13 +435,17 @@ export default function Bills() {
                   // monthly-family math; anchor_date feeds weekly/biweekly/custom.
                   const start = draft.start_date ?? todayISO();
                   const startDom = parseInt(start.slice(8, 10), 10) || 1;
+                  const isMonthly = ["monthly", "quarterly", "semiannual", "annual"].includes(
+                    draft.cadence_kind,
+                  );
                   const signed =
                     billKind === "income" ? Math.abs(draft.amount) : -Math.abs(draft.amount);
                   const final: RecurringBill = {
                     ...draft,
                     amount: signed,
                     start_date: start,
-                    day_of_month: startDom,
+                    // -1 = last day of month; otherwise the start date's day.
+                    day_of_month: isMonthly && lastDay ? -1 : startDom,
                     anchor_date: start,
                     interval_days:
                       draft.cadence_kind === "custom_days" ? draft.interval_days ?? null : null,

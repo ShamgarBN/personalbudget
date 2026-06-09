@@ -123,6 +123,15 @@ export const api = {
     amount: number;
     cleared: boolean;
   }) => invoke<number>("materialize_occurrence", args),
+  materializeBudgetItem: (args: {
+    accountId: number;
+    categoryId: number | null;
+    date: string;
+    amount: number;
+    description: string;
+    cleared: boolean;
+    budgetKey: string;
+  }) => invoke<number>("materialize_budget_item", args),
 
   listPayPeriodSchedules: () =>
     invoke<PayPeriodSchedule[]>("list_pay_period_schedules"),
