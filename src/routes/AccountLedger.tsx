@@ -1,4 +1,4 @@
-import { createContext, useContext, useMemo, useState, type ReactNode } from "react";
+import { useMemo, useState, type ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "@/api";
 import { asTree, makeColorResolver, CategoryColorContext, useCategoryColor } from "@/lib/categories";
@@ -6,34 +6,30 @@ import { ResizableTh, useColumnWidths } from "@/lib/columns";
 import { fmtDate, fmtUSD, todayISO } from "@/lib/formatting";
 import { projectOccurrences } from "@/lib/recurrence";
 import { useCollapsed } from "@/lib/collapse";
+import { useGhostOverrides } from "@/lib/ghostOverrides";
 import type { PayPeriod, Transaction } from "@/api/types";
 
-// A ledger row is either a real transaction or a projected "ghost" occurrence
-// of a recurring transaction (future-dated, editable, forecast-only).
-// Real rows that are credit-card payments carry the charge window so they can
-// expand to show the underlying card charges.
+// A ledger row is either a real transaction or a projected "ghost": a future
+// occurrence of a recurring transaction, or a budgeted item for a pay period.
+// Ghosts are editable + forecast-only until locked in (materialized).
 type LedgerItem = Transaction & {
-  ghostBillId?: number;
-  ccChargesFrom?: string;
-  ccChargesTo?: string;
+  ghostBillId?: number; // recurring ghost
+  ghostKey?: string; // stable override/lock key for any ghost
+  ghostBudgetCategoryId?: number; // budget ghost: category to record under
+  ghostBudgetKey?: string; // budget ghost: lock key "<catId>:<periodStart>"
 };
-const isGhost = (i: LedgerItem): boolean => i.ghostBillId != null;
+const isGhost = (i: LedgerItem): boolean => i.ghostBillId != null || i.ghostBudgetKey != null;
 
-// Heuristic: is this checking transaction a payment toward the credit card?
-function isCcPayment(t: LedgerItem): boolean {
-  if (t.ghostBillId != null || t.amount >= 0) return false;
-  const d = (t.title ?? t.description ?? "").toUpperCase();
-  return (
-    d.includes("APPLECARD") ||
-    d.includes("CREDIT CARD") ||
-    d.includes("CARD PAYMENT") ||
-    (t.category_name === "Transfer" && d.includes("CARD"))
-  );
-}
+// Whether a real row was locked in from a projection (so it shows a checkbox
+// that can be unchecked to undo it).
+const isLockedProjection = (i: LedgerItem): boolean =>
+  !isGhost(i) && (i.from_bill_id != null || i.from_budget_key != null);
 
-// Provides the credit-account id to ledger rows so a payment row can fetch the
-// charges it paid off, without threading the id through every grouping wrapper.
-const CcAccountContext = createContext<number | null>(null);
+type GhostHandlers = {
+  setAmount: (key: string, amount: number) => void;
+  lockIn: (item: LedgerItem) => void;
+  unlock: (id: number) => void;
+};
 
 function addDaysISO(isoDate: string, n: number): string {
   const d = new Date(isoDate + "T00:00:00");
@@ -159,16 +155,27 @@ export default function AccountLedger({
     enabled: !!account,
   });
 
-  // Pinned row reflects what would happen if we paid the credit card off
-  // as the last transaction of the displayed period. That means we need the
-  // CC's full current liability (opening + every CC transaction up to
-  // range.to), NOT just this period's activity. Otherwise a payment already
-  // made in the bank ledger this period double-counts.
-  const ccBalanceQuery = useQuery({
-    queryKey: ["account-balance-as-of", creditAccount?.id, range.to],
-    queryFn: () => api.accountBalanceAsOf(creditAccount!.id, range.to),
+  // The pinned "Credit Card Payment" row collects THIS period's credit-card
+  // charges (the transactions on the credit account within the visible range),
+  // so it can accordion open to itemize them. Only the charges in this window
+  // count — not the full running card balance.
+  const ccChargesQuery = useQuery({
+    queryKey: ["cc-period-charges", creditAccount?.id, range.from, range.to],
+    queryFn: () =>
+      api.listTransactions({
+        account_id: creditAccount!.id,
+        date_from: range.from,
+        date_to: range.to,
+        limit: 1000,
+      }),
     enabled: showPinnedCcPayment && !!creditAccount,
   });
+  const ccCharges = useMemo(
+    () => (ccChargesQuery.data?.rows ?? []).filter((r) => r.amount < 0).slice().reverse(),
+    [ccChargesQuery.data],
+  );
+  const ccChargesTotal = useMemo(() => ccCharges.reduce((s, c) => s + c.amount, 0), [ccCharges]);
+  const [ccExpanded, setCcExpanded] = useState(false);
 
   const update = useMutation({
     mutationFn: (args: Parameters<typeof api.updateTransaction>[0]) =>
@@ -201,19 +208,17 @@ export default function AccountLedger({
   const rows = useMemo(() => rawRows.slice().reverse(), [rawRows]);
   const total = rows.reduce((s, r) => s + r.amount, 0);
 
-  // CC current balance: negative = still owed on the card; positive = overpaid.
-  // Adding it to the bank's last running balance gives the post-CC-payoff bank
-  // balance: subtracting if owed, adding back if overpaid.
-  const ccCurrentBalance = ccBalanceQuery.data ?? 0;
+  // Projected bank balance after paying off this period's card charges:
+  // the bank's last actual running balance plus the (negative) charge total.
   const ccPinnedRunning = useMemo(() => {
     const lastWithRunning = [...rows].reverse().find((r) => r.running_balance != null);
     const baseline = lastWithRunning?.running_balance ?? 0;
-    return baseline + ccCurrentBalance;
-  }, [rows, ccCurrentBalance]);
+    return baseline + ccChargesTotal;
+  }, [rows, ccChargesTotal]);
 
-  // Recurring transactions for this account, projected forward as editable
-  // "ghost" rows (Bank Account only). They extend the running balance as a
-  // forecast and can be locked in (materialized) by editing or clearing.
+  // Projections (Bank Account only): recurring transactions + budgeted items
+  // appear as editable "ghost" rows that extend the running balance as a
+  // forecast until locked in.
   const bills = useQuery({ queryKey: ["recurring-bills"], queryFn: api.listRecurringBills });
   const catNameById = useMemo(() => {
     const m = new Map<number, string>();
@@ -221,49 +226,153 @@ export default function AccountLedger({
     return m;
   }, [categories.data]);
 
+  // Pay periods from today out 2 years, used to place budget projections.
+  // periods[0] is the period containing today.
+  const budgetPeriods = useQuery({
+    queryKey: ["pay-periods", "budget-proj", todayISO()],
+    queryFn: () => api.generatePayPeriods(todayISO(), addDaysISO(todayISO(), 730)),
+    enabled: showProjections,
+    retry: false,
+  });
+  const currentBudgetPeriod = budgetPeriods.data?.[0] ?? null;
+  const monthOf = (isoDate: string) => {
+    const d = new Date(isoDate + "T00:00:00");
+    return {
+      start: iso(new Date(d.getFullYear(), d.getMonth(), 1)),
+      end: iso(new Date(d.getFullYear(), d.getMonth() + 1, 1)),
+    };
+  };
+  // Current-period budget allocations + spend, so the current period projects
+  // only the *remaining* (unspent) budget.
+  const currentBudget = useQuery({
+    queryKey: ["budget-summary", currentBudgetPeriod?.start, currentBudgetPeriod?.end, "proj"],
+    queryFn: () => {
+      const mb = monthOf(currentBudgetPeriod!.start);
+      return api.budgetSummary(currentBudgetPeriod!.start, currentBudgetPeriod!.end, mb.start, mb.end);
+    },
+    enabled: showProjections && !!currentBudgetPeriod,
+  });
+
+  const overrides = useGhostOverrides((s) => s.amounts);
+
   const ghosts: LedgerItem[] = useMemo(() => {
     if (!showProjections || !account) return [];
     const t = todayISO();
     const afterToday = addDaysISO(t, 1);
     const horizon = addDaysISO(t, 730); // 2-year forecast
-    const startISO = range.from > afterToday ? range.from : afterToday;
-    const endISO = range.to < horizon ? range.to : horizon;
-    if (startISO > endISO) return [];
-    // Skip occurrences already locked in (a real txn carries from_bill_id).
-    const materialized = new Set(
-      rows.filter((r) => r.from_bill_id != null).map((r) => `${r.from_bill_id}:${r.date}`),
+
+    type Proj = {
+      date: string;
+      amount: number;
+      key: string; // override key
+      description: string;
+      categoryId: number | null;
+      categoryName: string | null;
+      billId?: number;
+      budgetKey?: string; // "<catId>:<periodStart>"
+      budgetCategoryId?: number;
+    };
+    const projected: Proj[] = [];
+
+    // --- Recurring ghosts: occurrences strictly after today, within view ---
+    const recStart = range.from > afterToday ? range.from : afterToday;
+    const recEnd = range.to < horizon ? range.to : horizon;
+    if (recStart <= recEnd) {
+      const materializedBill = new Set(
+        rows.filter((r) => r.from_bill_id != null).map((r) => `${r.from_bill_id}:${r.date}`),
+      );
+      for (const o of projectOccurrences(bills.data ?? [], recStart, recEnd)) {
+        if (o.account_id !== account.id) continue;
+        if (materializedBill.has(`${o.bill_id}:${o.date}`)) continue;
+        const key = `bill:${o.bill_id}:${o.date}`;
+        projected.push({
+          date: o.date,
+          amount: overrides[key] ?? o.amount,
+          key,
+          description: o.name,
+          categoryId: o.category_id,
+          categoryName: o.category_id != null ? catNameById.get(o.category_id) ?? null : null,
+          billId: o.bill_id,
+        });
+      }
+    }
+
+    // --- Budget ghosts: per-pay-period budgeted categories, current + future ---
+    const allocRows = (currentBudget.data?.rows ?? []).filter(
+      (r) => r.budget_basis === "per_pay_period" && r.allocated > 0.005,
     );
-    const occ = projectOccurrences(bills.data ?? [], startISO, endISO).filter(
-      (o) => o.account_id === account.id && !materialized.has(`${o.bill_id}:${o.date}`),
-    );
-    // Forecast running balance threads forward from today's actual balance.
+    if (allocRows.length > 0) {
+      const materializedBudget = new Set(
+        rows.filter((r) => r.from_budget_key != null).map((r) => r.from_budget_key as string),
+      );
+      const periods = budgetPeriods.data ?? [];
+      periods.forEach((p, pi) => {
+        // Place the projection on the period's last day (end is exclusive).
+        const ghostDate = addDaysISO(p.end, -1);
+        if (ghostDate < t || ghostDate < range.from || ghostDate > range.to) return;
+        const isCurrent = pi === 0;
+        for (const r of allocRows) {
+          const budgetKey = `${r.category_id}:${p.start}`;
+          if (materializedBudget.has(budgetKey)) continue;
+          const base = isCurrent ? -Math.max(0, r.allocated - r.spent) : -r.allocated;
+          if (Math.abs(base) < 0.005) continue;
+          const key = `budget:${budgetKey}`;
+          projected.push({
+            date: ghostDate,
+            amount: overrides[key] ?? base,
+            key,
+            description: `Budget · ${r.category_name}`,
+            categoryId: r.category_id,
+            categoryName: r.category_name,
+            budgetKey,
+            budgetCategoryId: r.category_id,
+          });
+        }
+      });
+    }
+
+    // Thread the forecast running balance forward from today's actual balance.
+    projected.sort((a, b) => a.date.localeCompare(b.date));
     let run = account.current_balance;
-    return occ.map((o, i) => {
-      run += o.amount;
+    return projected.map((pj, i) => {
+      run += pj.amount;
       return {
         id: -1 - i,
-        account_id: o.account_id,
-        date: o.date,
-        description: o.name,
+        account_id: account.id,
+        date: pj.date,
+        description: pj.description,
         title: null,
-        category_id: o.category_id,
-        category_name: o.category_id != null ? catNameById.get(o.category_id) ?? null : null,
-        amount: o.amount,
+        category_id: pj.categoryId,
+        category_name: pj.categoryName,
+        amount: pj.amount,
         memo: null,
         cleared: false,
         flagged: false,
         needs_review: false,
         split_of_id: null,
-        from_bill_id: o.bill_id,
+        from_bill_id: pj.billId ?? null,
+        from_budget_key: pj.budgetKey ?? null,
         running_balance: run,
-        ghostBillId: o.bill_id,
+        ghostBillId: pj.billId,
+        ghostKey: pj.key,
+        ghostBudgetKey: pj.budgetKey,
+        ghostBudgetCategoryId: pj.budgetCategoryId,
       };
     });
-  }, [showProjections, account, range.from, range.to, rows, bills.data, catNameById]);
+  }, [
+    showProjections,
+    account,
+    range.from,
+    range.to,
+    rows,
+    bills.data,
+    catNameById,
+    overrides,
+    currentBudget.data,
+    budgetPeriods.data,
+  ]);
 
   // Real rows + ghosts, ASC by date (real before ghost on the same day).
-  // Real rows are cloned so we can safely tag credit-card payments with the
-  // charge window they cover (never mutate react-query's cached objects).
   const items: LedgerItem[] = useMemo(() => {
     const merged: LedgerItem[] = [...rows.map((r) => ({ ...r })), ...ghosts];
     merged.sort(
@@ -272,33 +381,49 @@ export default function AccountLedger({
         (isGhost(a) ? 1 : 0) - (isGhost(b) ? 1 : 0) ||
         a.id - b.id,
     );
-    // Tag each credit-card payment with the window of charges it pays off:
-    // (previous payment date, this payment date].
-    if (showPinnedCcPayment && creditAccount) {
-      let lastPay = account?.opening_date ?? "1900-01-01";
-      for (const it of merged) {
-        if (isGhost(it)) continue;
-        if (isCcPayment(it)) {
-          it.ccChargesFrom = lastPay === (account?.opening_date ?? "1900-01-01") ? lastPay : addDaysISO(lastPay, 1);
-          it.ccChargesTo = it.date;
-          lastPay = it.date;
-        }
-      }
-    }
     return merged;
-  }, [rows, ghosts, showPinnedCcPayment, creditAccount, account]);
+  }, [rows, ghosts]);
 
+  const invalidateAfterLock = () => {
+    qc.invalidateQueries({ queryKey: ["transactions"] });
+    qc.invalidateQueries({ queryKey: ["accounts"] });
+    qc.invalidateQueries({ queryKey: ["dashboard"] });
+    qc.invalidateQueries({ queryKey: ["budget-summary"] });
+  };
   const materialize = useMutation({
     mutationFn: (a: { billId: number; date: string; amount: number; cleared: boolean }) =>
       api.materializeOccurrence(a),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["transactions"] });
-      qc.invalidateQueries({ queryKey: ["accounts"] });
-      qc.invalidateQueries({ queryKey: ["dashboard"] });
-    },
+    onSuccess: invalidateAfterLock,
   });
-  const onMaterialize = (billId: number, date: string, amount: number, cleared: boolean) =>
-    materialize.mutate({ billId, date, amount, cleared });
+  const materializeBudget = useMutation({
+    mutationFn: (a: Parameters<typeof api.materializeBudgetItem>[0]) => api.materializeBudgetItem(a),
+    onSuccess: invalidateAfterLock,
+  });
+  const setOverride = useGhostOverrides((s) => s.set);
+  const clearOverride = useGhostOverrides((s) => s.clear);
+
+  // Edit a ghost's amount (persisted override; affects the forecast only).
+  const onSetGhostAmount = (key: string, amount: number) => setOverride(key, amount);
+  // Check the box → lock in (materialize) the projection as a real cleared txn.
+  const onLockIn = (item: LedgerItem) => {
+    if (item.ghostBillId != null) {
+      materialize.mutate({ billId: item.ghostBillId, date: item.date, amount: item.amount, cleared: true });
+    } else if (item.ghostBudgetKey != null) {
+      materializeBudget.mutate({
+        accountId: item.account_id,
+        categoryId: item.ghostBudgetCategoryId ?? null,
+        date: item.date,
+        amount: item.amount,
+        description: item.description,
+        cleared: true,
+        budgetKey: item.ghostBudgetKey,
+      });
+    }
+    if (item.ghostKey) clearOverride(item.ghostKey);
+  };
+  // Uncheck the box on a locked-in projection → delete it (revert to a ghost).
+  const onUnlock = (id: number) => del.mutate(id);
+  const ghostHandlers: GhostHandlers = { setAmount: onSetGhostAmount, lockIn: onLockIn, unlock: onUnlock };
 
   // When pay-period grouping is on, fetch the periods that overlap the
   // visible range. Using the displayed-row span (rather than range.from/to)
@@ -348,7 +473,6 @@ export default function AccountLedger({
 
   return (
     <CategoryColorContext.Provider value={colorOf}>
-    <CcAccountContext.Provider value={showPinnedCcPayment ? creditAccount?.id ?? null : null}>
     <div className="p-6 space-y-4 text-gray-900">
       <div className="flex items-end justify-between flex-wrap gap-3">
         <div>
@@ -613,7 +737,7 @@ export default function AccountLedger({
                               groupKey={`acct:${accountKind}:pp:${bucket.period.start}`}
                               onUpdate={(args) => update.mutate(args)}
                               onDelete={(id) => del.mutate(id)}
-                              onMaterialize={onMaterialize}
+                              ghost={ghostHandlers}
                               defaultOpen={bucket === lastBucket}
                             />
                           ))}
@@ -628,7 +752,7 @@ export default function AccountLedger({
                         groupKey={`acct:${accountKind}:pp:orphans`}
                         onUpdate={(args) => update.mutate(args)}
                         onDelete={(id) => del.mutate(id)}
-                        onMaterialize={onMaterialize}
+                        ghost={ghostHandlers}
                         defaultOpen={false}
                       />
                     )}
@@ -645,7 +769,7 @@ export default function AccountLedger({
                       groupKey={`acct:${accountKind}:half1:${range.from}`}
                       onUpdate={(args) => update.mutate(args)}
                       onDelete={(id) => del.mutate(id)}
-                      onMaterialize={onMaterialize}
+                      ghost={ghostHandlers}
                     />
                     <HalfBody
                       label={`Days 16 – end of month (${groupedHalves.secondHalf.length})`}
@@ -654,7 +778,7 @@ export default function AccountLedger({
                       groupKey={`acct:${accountKind}:half2:${range.from}`}
                       onUpdate={(args) => update.mutate(args)}
                       onDelete={(id) => del.mutate(id)}
-                      onMaterialize={onMaterialize}
+                      ghost={ghostHandlers}
                     />
                   </>
                 );
@@ -668,23 +792,55 @@ export default function AccountLedger({
                       categories={categoryTree}
                       onUpdate={(args) => update.mutate(args)}
                       onDelete={(id) => del.mutate(id)}
-                      onMaterialize={onMaterialize}
+                      ghost={ghostHandlers}
                     />
                   ))}
                 </tbody>
               );
             })()}
             {showPinnedCcPayment && creditAccount && (
-              <tfoot className="sticky bottom-0 bg-amber-50 border-t-2 border-amber-200">
+              <tfoot className={`${ccExpanded ? "" : "sticky bottom-0"} bg-amber-50 border-t-2 border-amber-200`}>
+                {ccExpanded &&
+                  (ccCharges.length === 0 ? (
+                    <tr className="bg-amber-50/60">
+                      <td colSpan={7} className="px-3 py-2 pl-10 text-xs text-amber-800/70 italic">
+                        No credit-card charges in {range.label}.
+                      </td>
+                    </tr>
+                  ) : (
+                    ccCharges.map((c) => (
+                      <tr key={`ccp-${c.id}`} className="bg-amber-50/50 text-xs text-amber-900/80">
+                        <td className="px-3 py-1 pl-10 whitespace-nowrap">{fmtDate(c.date)}</td>
+                        <td className="px-3 py-1 truncate" colSpan={3}>
+                          <span className="line-clamp-1" title={c.description}>
+                            {c.title ?? c.description}
+                          </span>
+                        </td>
+                        <td className="px-3 py-1 text-right tabular-nums text-red-700">{fmtUSD(c.amount)}</td>
+                        <td className="px-3 py-1" />
+                        <td className="px-3 py-1 text-right text-[10px] text-amber-700/60 italic whitespace-nowrap">
+                          on {creditAccount.name}
+                        </td>
+                      </tr>
+                    ))
+                  ))}
                 <tr>
                   <td className="px-3 py-2 text-amber-900 font-medium" colSpan={4}>
-                    Credit Card Payment{" "}
-                    <span className="text-xs text-amber-700 font-normal">
-                      (projected — pays off {creditAccount.name} balance as of {range.label})
-                    </span>
+                    <button
+                      type="button"
+                      onClick={() => setCcExpanded((o) => !o)}
+                      className="flex items-center gap-2 hover:text-black"
+                      title="Show this period's credit-card charges"
+                    >
+                      <span className="inline-block w-3">{ccExpanded ? "▾" : "▸"}</span>
+                      Credit Card Payment{" "}
+                      <span className="text-xs text-amber-700 font-normal normal-case">
+                        (projected — {creditAccount.name} charges in {range.label})
+                      </span>
+                    </button>
                   </td>
-                  <td className={`px-3 py-2 text-right font-semibold tabular-nums ${ccCurrentBalance < 0 ? "text-red-700" : "text-amber-900"}`}>
-                    {fmtUSD(ccCurrentBalance)}
+                  <td className={`px-3 py-2 text-right font-semibold tabular-nums ${ccChargesTotal < 0 ? "text-red-700" : "text-amber-900"}`}>
+                    {fmtUSD(ccChargesTotal)}
                   </td>
                   <td className={`px-3 py-2 text-right font-semibold tabular-nums ${ccPinnedRunning < 0 ? "text-red-700" : "text-amber-900"}`}>
                     {fmtUSD(ccPinnedRunning)}
@@ -697,7 +853,6 @@ export default function AccountLedger({
         </div>
       )}
     </div>
-    </CcAccountContext.Provider>
     </CategoryColorContext.Provider>
   );
 }
@@ -752,7 +907,7 @@ function PeriodBody({
   groupKey,
   onUpdate,
   onDelete,
-  onMaterialize,
+  ghost,
   defaultOpen = true,
 }: {
   label: string;
@@ -761,7 +916,7 @@ function PeriodBody({
   groupKey: string;
   onUpdate: (args: Parameters<typeof api.updateTransaction>[0]) => void;
   onDelete: (id: number) => void;
-  onMaterialize: (billId: number, date: string, amount: number, cleared: boolean) => void;
+  ghost: GhostHandlers;
   defaultOpen?: boolean;
 }) {
   const [open, toggle] = useCollapsed(groupKey, defaultOpen);
@@ -793,7 +948,7 @@ function PeriodBody({
             categories={categories}
             onUpdate={onUpdate}
             onDelete={onDelete}
-            onMaterialize={onMaterialize}
+            ghost={ghost}
           />
         ))}
     </tbody>
@@ -807,7 +962,7 @@ function HalfBody({
   groupKey,
   onUpdate,
   onDelete,
-  onMaterialize,
+  ghost,
 }: {
   label: string;
   rows: LedgerItem[];
@@ -815,7 +970,7 @@ function HalfBody({
   groupKey: string;
   onUpdate: (args: Parameters<typeof api.updateTransaction>[0]) => void;
   onDelete: (id: number) => void;
-  onMaterialize: (billId: number, date: string, amount: number, cleared: boolean) => void;
+  ghost: GhostHandlers;
 }) {
   const [open, toggle] = useCollapsed(groupKey, true);
   const total = rows.reduce((s, r) => s + r.amount, 0);
@@ -846,7 +1001,7 @@ function HalfBody({
             categories={categories}
             onUpdate={onUpdate}
             onDelete={onDelete}
-            onMaterialize={onMaterialize}
+            ghost={ghost}
           />
         ))}
       {open && rows.length === 0 && (
@@ -865,40 +1020,19 @@ function LedgerRow({
   categories,
   onUpdate,
   onDelete,
-  onMaterialize,
+  ghost,
 }: {
   t: LedgerItem;
   categories: ReturnType<typeof asTree>;
   onUpdate: (args: Parameters<typeof api.updateTransaction>[0]) => void;
   onDelete: (id: number) => void;
-  onMaterialize: (billId: number, date: string, amount: number, cleared: boolean) => void;
+  ghost: GhostHandlers;
 }) {
   const colorOf = useCategoryColor();
-  const creditAccountId = useContext(CcAccountContext);
-  const [expanded, setExpanded] = useState(false);
-  const isCcPay =
-    t.ghostBillId == null &&
-    t.ccChargesFrom != null &&
-    t.ccChargesTo != null &&
-    creditAccountId != null;
-  const charges = useQuery({
-    queryKey: ["cc-charges", creditAccountId, t.ccChargesFrom, t.ccChargesTo, t.id],
-    queryFn: () =>
-      api.listTransactions({
-        account_id: creditAccountId!,
-        date_from: t.ccChargesFrom!,
-        date_to: t.ccChargesTo!,
-        limit: 500,
-      }),
-    enabled: isCcPay && expanded,
-  });
-  const chargeRows = (charges.data?.rows ?? []).filter((c) => c.amount < 0);
-  const chargeTotal = chargeRows.reduce((s, c) => s + c.amount, 0);
-  // Projected (ghost) occurrence of a recurring transaction: faint, editable
-  // amount, and a "lock in" action. Editing the amount or clicking the check
-  // materializes this one occurrence into a real transaction.
-  if (t.ghostBillId != null) {
-    const billId = t.ghostBillId;
+
+  // Projected (ghost) row: a recurring occurrence or a budgeted item. Faint,
+  // with an editable amount and an unchecked "lock in" box.
+  if (isGhost(t)) {
     return (
       <tr className="border-t border-dashed border-gray-200 bg-blue-50/20 text-gray-500 italic">
         <td className="px-3 py-1.5 whitespace-nowrap truncate">{fmtDate(t.date)}</td>
@@ -907,7 +1041,7 @@ function LedgerRow({
             {t.description}
           </span>
           <span className="ml-1.5 not-italic text-[9px] uppercase tracking-wide text-blue-600/70 align-middle">
-            scheduled
+            {t.ghostBudgetKey != null ? "budgeted" : "scheduled"}
           </span>
         </td>
         <td className="px-3 py-1.5 text-gray-400">—</td>
@@ -925,42 +1059,31 @@ function LedgerRow({
         <td className={`px-3 py-1.5 text-right tabular-nums ${t.amount < 0 ? "text-red-600/80" : "text-green-700/80"}`}>
           <GhostAmount
             value={t.amount}
-            onCommit={(amount) => onMaterialize(billId, t.date, amount, false)}
+            onCommit={(amount) => t.ghostKey && ghost.setAmount(t.ghostKey, amount)}
           />
         </td>
         <td className="px-3 py-1.5 text-right tabular-nums text-gray-400 truncate">
           {t.running_balance != null ? fmtUSD(t.running_balance) : ""}
         </td>
-        <td className="px-3 py-1.5 text-right whitespace-nowrap">
-          <button
-            title="Mark cleared & lock this occurrence in"
-            onClick={() => onMaterialize(billId, t.date, t.amount, true)}
-            className="text-xs not-italic text-gray-500 hover:text-green-700"
-          >
-            ✓ Lock in
-          </button>
+        <td className="px-3 py-1.5 text-center whitespace-nowrap">
+          <input
+            type="checkbox"
+            checked={false}
+            onChange={() => ghost.lockIn(t)}
+            title="Lock this in as a real transaction"
+            className="cursor-pointer align-middle"
+          />
         </td>
       </tr>
     );
   }
+
+  const locked = isLockedProjection(t);
   return (
-    <>
     <tr className={`border-t border-gray-100 hover:bg-gray-50 ${t.flagged ? "ring-1 ring-amber-300/40" : ""}`}>
       <td className="px-3 py-1.5 whitespace-nowrap text-gray-800 truncate">{fmtDate(t.date)}</td>
       <td className="px-3 py-1.5 truncate">
-        <span className="flex items-center gap-1">
-          {isCcPay && (
-            <button
-              type="button"
-              onClick={() => setExpanded((o) => !o)}
-              className="text-gray-400 hover:text-gray-700 shrink-0"
-              title="Show the card charges this payment covers"
-            >
-              <span className="inline-block w-3">{expanded ? "▾" : "▸"}</span>
-            </button>
-          )}
-          <span className="line-clamp-1" title={t.description}>{t.title ?? t.description}</span>
-        </span>
+        <span className="line-clamp-1" title={t.description}>{t.title ?? t.description}</span>
       </td>
       <td className="px-3 py-1.5">
         <MemoCell value={t.memo} onSave={(v) => onUpdate({ id: t.id, memo: v })} />
@@ -994,59 +1117,26 @@ function LedgerRow({
         {t.running_balance != null ? fmtUSD(t.running_balance) : ""}
       </td>
       <td className="px-3 py-1.5 text-right whitespace-nowrap">
-        <button
-          onClick={() => {
-            if (confirm("Delete this transaction?")) onDelete(t.id);
-          }}
-          className="text-xs text-gray-600 hover:text-red-700"
-        >
-          Delete
-        </button>
+        {locked ? (
+          <input
+            type="checkbox"
+            checked
+            onChange={() => ghost.unlock(t.id)}
+            title="Locked in from a projection — uncheck to undo"
+            className="cursor-pointer align-middle"
+          />
+        ) : (
+          <button
+            onClick={() => {
+              if (confirm("Delete this transaction?")) onDelete(t.id);
+            }}
+            className="text-xs text-gray-600 hover:text-red-700"
+          >
+            Delete
+          </button>
+        )}
       </td>
     </tr>
-    {isCcPay && expanded && (
-      <>
-        {charges.isLoading && (
-          <tr className="bg-gray-50/60">
-            <td colSpan={7} className="px-3 py-2 pl-10 text-xs text-gray-500">
-              Loading card charges…
-            </td>
-          </tr>
-        )}
-        {!charges.isLoading && chargeRows.length === 0 && (
-          <tr className="bg-gray-50/60">
-            <td colSpan={7} className="px-3 py-2 pl-10 text-xs text-gray-500 italic">
-              No card charges found between {fmtDate(t.ccChargesFrom!)} and {fmtDate(t.ccChargesTo!)}.
-            </td>
-          </tr>
-        )}
-        {chargeRows.map((c) => (
-          <tr key={`cc-${c.id}`} className="bg-gray-50/60 text-xs text-gray-600">
-            <td className="px-3 py-1 pl-10 whitespace-nowrap">{fmtDate(c.date)}</td>
-            <td className="px-3 py-1 truncate" colSpan={3}>
-              <span className="line-clamp-1" title={c.description}>{c.title ?? c.description}</span>
-            </td>
-            <td className="px-3 py-1 text-right tabular-nums text-red-700">{fmtUSD(c.amount)}</td>
-            <td className="px-3 py-1" />
-            <td className="px-3 py-1 text-right text-[10px] text-gray-400 italic whitespace-nowrap">
-              on Credit Card
-            </td>
-          </tr>
-        ))}
-        {chargeRows.length > 0 && (
-          <tr className="bg-gray-50 text-xs border-b border-gray-200">
-            <td colSpan={4} className="px-3 py-1 pl-10 text-gray-500">
-              {chargeRows.length} charge{chargeRows.length === 1 ? "" : "s"} · already counted once via the payment above
-            </td>
-            <td className="px-3 py-1 text-right tabular-nums font-medium text-gray-700">
-              {fmtUSD(chargeTotal)}
-            </td>
-            <td colSpan={2} />
-          </tr>
-        )}
-      </>
-    )}
-    </>
   );
 }
 

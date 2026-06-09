@@ -61,6 +61,7 @@ pub fn run() {
             commands::transactions::unsplit_transaction,
             commands::transactions::get_transaction,
             commands::transactions::materialize_occurrence,
+            commands::transactions::materialize_budget_item,
             commands::pay_periods::list_pay_period_schedules,
             commands::pay_periods::upsert_pay_period_schedule,
             commands::pay_periods::delete_pay_period_schedule,

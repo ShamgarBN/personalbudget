@@ -301,7 +301,9 @@ fn bill_hits_on(bill: &Bill, on: NaiveDate, from: NaiveDate) -> bool {
 }
 
 fn clamp_day(date: NaiveDate, day: i64) -> i64 {
-    // Returns the day-of-month a bill would hit this month, clamped to month length.
+    // Returns the day-of-month a bill would hit this month. A sentinel of -1
+    // means "last day of month"; otherwise the value is clamped to the month's
+    // length so a 31 in February resolves to the 28th/29th.
     let last = NaiveDate::from_ymd_opt(
         if date.month() == 12 { date.year() + 1 } else { date.year() },
         if date.month() == 12 { 1 } else { date.month() + 1 },
@@ -311,7 +313,11 @@ fn clamp_day(date: NaiveDate, day: i64) -> i64 {
     .pred_opt()
     .unwrap()
     .day() as i64;
-    day.min(last)
+    if day == -1 {
+        last
+    } else {
+        day.min(last)
+    }
 }
 
 fn active_schedule_period(conn: &Connection, on: NaiveDate) -> AppResult<(PayPeriodSchedule, (NaiveDate, NaiveDate))> {

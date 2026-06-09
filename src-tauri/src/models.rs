@@ -46,6 +46,8 @@ pub struct Transaction {
     pub split_of_id: Option<i64>,
     /// The recurring transaction this row was materialized from, if any.
     pub from_bill_id: Option<i64>,
+    /// The budget projection this row was locked in from ("<catId>:<periodStart>").
+    pub from_budget_key: Option<String>,
     /// Account balance immediately after this transaction posted, computed
     /// over the full history for this account regardless of any active filter.
     /// Null for split children (their amounts roll up under the parent).

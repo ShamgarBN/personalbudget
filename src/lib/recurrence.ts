@@ -9,9 +9,12 @@ export interface Occurrence {
   amount: number; // signed: negative = expense, positive = income
 }
 
-function clampDay(year: number, monthIndex0: number, day: number): number {
+// Resolves the day-of-month a monthly-family bill hits in a given month.
+// A sentinel of -1 means "last day of the month"; any other value is clamped
+// to the month's length (e.g. a 31 in February becomes the 28th/29th).
+function monthlyHitDay(year: number, monthIndex0: number, day: number): number {
   const last = new Date(year, monthIndex0 + 1, 0).getDate();
-  return Math.min(day, last);
+  return day === -1 ? last : Math.min(day, last);
 }
 
 /// Does this recurring transaction land on `date`? Mirrors the backend's
@@ -30,23 +33,23 @@ export function occursOn(b: RecurringBill, date: Date): boolean {
   const month = date.getMonth() + 1;
   switch (b.cadence_kind) {
     case "monthly":
-      return b.day_of_month != null && dom === clampDay(date.getFullYear(), date.getMonth(), b.day_of_month);
+      return b.day_of_month != null && dom === monthlyHitDay(date.getFullYear(), date.getMonth(), b.day_of_month);
     case "quarterly":
       return (
         b.day_of_month != null &&
-        dom === clampDay(date.getFullYear(), date.getMonth(), b.day_of_month) &&
+        dom === monthlyHitDay(date.getFullYear(), date.getMonth(), b.day_of_month) &&
         [1, 4, 7, 10].includes(month)
       );
     case "semiannual":
       return (
         b.day_of_month != null &&
-        dom === clampDay(date.getFullYear(), date.getMonth(), b.day_of_month) &&
+        dom === monthlyHitDay(date.getFullYear(), date.getMonth(), b.day_of_month) &&
         [1, 7].includes(month)
       );
     case "annual":
       return (
         b.day_of_month != null &&
-        dom === clampDay(date.getFullYear(), date.getMonth(), b.day_of_month) &&
+        dom === monthlyHitDay(date.getFullYear(), date.getMonth(), b.day_of_month) &&
         month === 1
       );
     case "weekly":
