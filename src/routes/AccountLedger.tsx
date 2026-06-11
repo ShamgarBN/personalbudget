@@ -379,12 +379,21 @@ export default function AccountLedger({
   // and ghosts continue the running sum from the last real row above them.
   const items: LedgerItem[] = useMemo(() => {
     const merged: LedgerItem[] = [...rows.map((r) => ({ ...r })), ...ghosts];
-    merged.sort(
-      (a, b) =>
-        a.date.localeCompare(b.date) ||
-        (isGhost(a) ? 1 : 0) - (isGhost(b) ? 1 : 0) ||
-        (isGhost(a) && isGhost(b) ? (a.ghostSeq ?? 0) - (b.ghostSeq ?? 0) : a.id - b.id),
-    );
+    merged.sort((a, b) => {
+      if (a.date !== b.date) return a.date.localeCompare(b.date);
+      const ag = isGhost(a);
+      const bg = isGhost(b);
+      if (ag !== bg) return ag ? 1 : -1; // real rows before ghosts on the same day
+      if (!ag) return a.id - b.id; // both real → backend order (date, id)
+      // Both ghosts on the same day: projected expenses before income, so a
+      // paycheck never inflates the running balance of the spending above it.
+      const ai = a.amount >= 0 ? 1 : 0;
+      const bi = b.amount >= 0 ? 1 : 0;
+      return ai - bi || (a.ghostSeq ?? 0) - (b.ghostSeq ?? 0);
+    });
+    // Running balance, strictly top-to-bottom in this exact display order. Real
+    // rows keep their authoritative backend balance; each ghost continues the
+    // sum from the row directly above it.
     let run: number | null = null;
     for (const it of merged) {
       if (!isGhost(it)) {
