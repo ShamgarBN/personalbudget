@@ -17,6 +17,7 @@ type LedgerItem = Transaction & {
   ghostKey?: string; // stable override/lock key for any ghost
   ghostBudgetCategoryId?: number; // budget ghost: category to record under
   ghostBudgetKey?: string; // budget ghost: lock key "<catId>:<periodStart>"
+  ghostSeq?: number; // stable display order among same-date ghosts
 };
 const isGhost = (i: LedgerItem): boolean => i.ghostBillId != null || i.ghostBudgetKey != null;
 
@@ -331,34 +332,33 @@ export default function AccountLedger({
       });
     }
 
-    // Thread the forecast running balance forward from today's actual balance.
+    // Order projections chronologically; the running balance is computed later
+    // in a single top-to-bottom pass over the merged display list so it always
+    // sums in ledger order.
     projected.sort((a, b) => a.date.localeCompare(b.date));
-    let run = account.current_balance;
-    return projected.map((pj, i) => {
-      run += pj.amount;
-      return {
-        id: -1 - i,
-        account_id: account.id,
-        date: pj.date,
-        description: pj.description,
-        title: null,
-        category_id: pj.categoryId,
-        category_name: pj.categoryName,
-        amount: pj.amount,
-        memo: null,
-        cleared: false,
-        flagged: false,
-        needs_review: false,
-        split_of_id: null,
-        from_bill_id: pj.billId ?? null,
-        from_budget_key: pj.budgetKey ?? null,
-        running_balance: run,
-        ghostBillId: pj.billId,
-        ghostKey: pj.key,
-        ghostBudgetKey: pj.budgetKey,
-        ghostBudgetCategoryId: pj.budgetCategoryId,
-      };
-    });
+    return projected.map((pj, i) => ({
+      id: -1 - i,
+      account_id: account.id,
+      date: pj.date,
+      description: pj.description,
+      title: null,
+      category_id: pj.categoryId,
+      category_name: pj.categoryName,
+      amount: pj.amount,
+      memo: null,
+      cleared: false,
+      flagged: false,
+      needs_review: false,
+      split_of_id: null,
+      from_bill_id: pj.billId ?? null,
+      from_budget_key: pj.budgetKey ?? null,
+      running_balance: null,
+      ghostBillId: pj.billId,
+      ghostKey: pj.key,
+      ghostBudgetKey: pj.budgetKey,
+      ghostBudgetCategoryId: pj.budgetCategoryId,
+      ghostSeq: i,
+    }));
   }, [
     showProjections,
     account,
@@ -372,17 +372,31 @@ export default function AccountLedger({
     budgetPeriods.data,
   ]);
 
-  // Real rows + ghosts, ASC by date (real before ghost on the same day).
+  // Real rows + ghosts, in stable display order: by date, real before ghost on
+  // the same day, then real rows by id and ghosts by their projection sequence.
+  // The running balance is then computed in one top-to-bottom pass so it always
+  // sums in ledger order — real rows keep their authoritative backend running,
+  // and ghosts continue the running sum from the last real row above them.
   const items: LedgerItem[] = useMemo(() => {
     const merged: LedgerItem[] = [...rows.map((r) => ({ ...r })), ...ghosts];
     merged.sort(
       (a, b) =>
         a.date.localeCompare(b.date) ||
         (isGhost(a) ? 1 : 0) - (isGhost(b) ? 1 : 0) ||
-        a.id - b.id,
+        (isGhost(a) && isGhost(b) ? (a.ghostSeq ?? 0) - (b.ghostSeq ?? 0) : a.id - b.id),
     );
+    let run: number | null = null;
+    for (const it of merged) {
+      if (!isGhost(it)) {
+        if (it.running_balance != null) run = it.running_balance;
+      } else {
+        if (run == null) run = account?.current_balance ?? 0;
+        run += it.amount;
+        it.running_balance = run;
+      }
+    }
     return merged;
-  }, [rows, ghosts]);
+  }, [rows, ghosts, account]);
 
   const invalidateAfterLock = () => {
     qc.invalidateQueries({ queryKey: ["transactions"] });
@@ -800,6 +814,29 @@ export default function AccountLedger({
             })()}
             {showPinnedCcPayment && creditAccount && (
               <tfoot className={`${ccExpanded ? "" : "sticky bottom-0"} bg-amber-50 border-t-2 border-amber-200`}>
+                <tr>
+                  <td className="px-3 py-2 text-amber-900 font-medium" colSpan={4}>
+                    <button
+                      type="button"
+                      onClick={() => setCcExpanded((o) => !o)}
+                      className="flex items-center gap-2 hover:text-black"
+                      title="Show this period's credit-card charges"
+                    >
+                      <span className="inline-block w-3">{ccExpanded ? "▾" : "▸"}</span>
+                      Credit Card Payment{" "}
+                      <span className="text-xs text-amber-700 font-normal normal-case">
+                        (projected — {creditAccount.name} charges in {range.label})
+                      </span>
+                    </button>
+                  </td>
+                  <td className={`px-3 py-2 text-right font-semibold tabular-nums ${ccChargesTotal < 0 ? "text-red-700" : "text-amber-900"}`}>
+                    {fmtUSD(ccChargesTotal)}
+                  </td>
+                  <td className={`px-3 py-2 text-right font-semibold tabular-nums ${ccPinnedRunning < 0 ? "text-red-700" : "text-amber-900"}`}>
+                    {fmtUSD(ccPinnedRunning)}
+                  </td>
+                  <td />
+                </tr>
                 {ccExpanded &&
                   (ccCharges.length === 0 ? (
                     <tr className="bg-amber-50/60">
@@ -824,29 +861,6 @@ export default function AccountLedger({
                       </tr>
                     ))
                   ))}
-                <tr>
-                  <td className="px-3 py-2 text-amber-900 font-medium" colSpan={4}>
-                    <button
-                      type="button"
-                      onClick={() => setCcExpanded((o) => !o)}
-                      className="flex items-center gap-2 hover:text-black"
-                      title="Show this period's credit-card charges"
-                    >
-                      <span className="inline-block w-3">{ccExpanded ? "▾" : "▸"}</span>
-                      Credit Card Payment{" "}
-                      <span className="text-xs text-amber-700 font-normal normal-case">
-                        (projected — {creditAccount.name} charges in {range.label})
-                      </span>
-                    </button>
-                  </td>
-                  <td className={`px-3 py-2 text-right font-semibold tabular-nums ${ccChargesTotal < 0 ? "text-red-700" : "text-amber-900"}`}>
-                    {fmtUSD(ccChargesTotal)}
-                  </td>
-                  <td className={`px-3 py-2 text-right font-semibold tabular-nums ${ccPinnedRunning < 0 ? "text-red-700" : "text-amber-900"}`}>
-                    {fmtUSD(ccPinnedRunning)}
-                  </td>
-                  <td />
-                </tr>
               </tfoot>
             )}
           </table>
