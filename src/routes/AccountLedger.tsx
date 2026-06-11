@@ -209,14 +209,6 @@ export default function AccountLedger({
   const rows = useMemo(() => rawRows.slice().reverse(), [rawRows]);
   const total = rows.reduce((s, r) => s + r.amount, 0);
 
-  // Projected bank balance after paying off this period's card charges:
-  // the bank's last actual running balance plus the (negative) charge total.
-  const ccPinnedRunning = useMemo(() => {
-    const lastWithRunning = [...rows].reverse().find((r) => r.running_balance != null);
-    const baseline = lastWithRunning?.running_balance ?? 0;
-    return baseline + ccChargesTotal;
-  }, [rows, ccChargesTotal]);
-
   // Projections (Bank Account only): recurring transactions + budgeted items
   // appear as editable "ghost" rows that extend the running balance as a
   // forecast until locked in.
@@ -406,6 +398,15 @@ export default function AccountLedger({
     }
     return merged;
   }, [rows, ghosts, account]);
+
+  // The projected Credit Card payoff sits at the very bottom of the ledger, so
+  // its running balance continues from the last row above it — which already
+  // reflects every real AND projected (ghost) transaction in the view.
+  const ccPinnedRunning = useMemo(() => {
+    const last = items[items.length - 1];
+    const baseline = last?.running_balance ?? account?.current_balance ?? 0;
+    return baseline + ccChargesTotal;
+  }, [items, ccChargesTotal, account]);
 
   const invalidateAfterLock = () => {
     qc.invalidateQueries({ queryKey: ["transactions"] });
