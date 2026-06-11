@@ -30,6 +30,7 @@ type GhostHandlers = {
   setAmount: (key: string, amount: number) => void;
   lockIn: (item: LedgerItem) => void;
   unlock: (id: number) => void;
+  dismiss: (key: string) => void;
 };
 
 function addDaysISO(isoDate: string, n: number): string {
@@ -247,6 +248,7 @@ export default function AccountLedger({
   });
 
   const overrides = useGhostOverrides((s) => s.amounts);
+  const dismissed = useGhostOverrides((s) => s.dismissed);
 
   const ghosts: LedgerItem[] = useMemo(() => {
     if (!showProjections || !account) return [];
@@ -278,6 +280,7 @@ export default function AccountLedger({
         if (o.account_id !== account.id) continue;
         if (materializedBill.has(`${o.bill_id}:${o.date}`)) continue;
         const key = `bill:${o.bill_id}:${o.date}`;
+        if (dismissed[key]) continue; // user deleted this projected occurrence
         projected.push({
           date: o.date,
           amount: overrides[key] ?? o.amount,
@@ -310,6 +313,7 @@ export default function AccountLedger({
           const base = isCurrent ? -Math.max(0, r.allocated - r.spent) : -r.allocated;
           if (Math.abs(base) < 0.005) continue;
           const key = `budget:${budgetKey}`;
+          if (dismissed[key]) continue; // user deleted this projected item
           projected.push({
             date: ghostDate,
             amount: overrides[key] ?? base,
@@ -360,6 +364,7 @@ export default function AccountLedger({
     bills.data,
     catNameById,
     overrides,
+    dismissed,
     currentBudget.data,
     budgetPeriods.data,
   ]);
@@ -425,6 +430,7 @@ export default function AccountLedger({
   });
   const setOverride = useGhostOverrides((s) => s.set);
   const clearOverride = useGhostOverrides((s) => s.clear);
+  const dismissGhost = useGhostOverrides((s) => s.dismiss);
 
   // Edit a ghost's amount (persisted override; affects the forecast only).
   const onSetGhostAmount = (key: string, amount: number) => setOverride(key, amount);
@@ -447,7 +453,14 @@ export default function AccountLedger({
   };
   // Uncheck the box on a locked-in projection → delete it (revert to a ghost).
   const onUnlock = (id: number) => del.mutate(id);
-  const ghostHandlers: GhostHandlers = { setAmount: onSetGhostAmount, lockIn: onLockIn, unlock: onUnlock };
+  // Delete a projected occurrence from the view (hides just this one).
+  const onDismiss = (key: string) => dismissGhost(key);
+  const ghostHandlers: GhostHandlers = {
+    setAmount: onSetGhostAmount,
+    lockIn: onLockIn,
+    unlock: onUnlock,
+    dismiss: onDismiss,
+  };
 
   // When pay-period grouping is on, fetch the periods that overlap the
   // visible range. Using the displayed-row span (rather than range.from/to)
@@ -1089,14 +1102,24 @@ function LedgerRow({
         <td className="px-3 py-1.5 text-right tabular-nums text-gray-400 truncate">
           {t.running_balance != null ? fmtUSD(t.running_balance) : ""}
         </td>
-        <td className="px-3 py-1.5 text-center whitespace-nowrap">
-          <input
-            type="checkbox"
-            checked={false}
-            onChange={() => ghost.lockIn(t)}
-            title="Lock this in as a real transaction"
-            className="cursor-pointer align-middle"
-          />
+        <td className="px-3 py-1.5 whitespace-nowrap">
+          <div className="flex items-center justify-center gap-3">
+            <input
+              type="checkbox"
+              checked={false}
+              onChange={() => ghost.lockIn(t)}
+              title="Lock this in as a real transaction"
+              className="cursor-pointer align-middle"
+            />
+            <button
+              type="button"
+              onClick={() => t.ghostKey && ghost.dismiss(t.ghostKey)}
+              title="Remove this projected item from the ledger"
+              className="text-xs not-italic text-gray-400 hover:text-red-700"
+            >
+              Delete
+            </button>
+          </div>
         </td>
       </tr>
     );
