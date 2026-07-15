@@ -20,6 +20,7 @@ import type {
   MonthlyNetWorth,
   NewTransaction,
   PayPeriod,
+  Transaction,
   PayPeriodSchedule,
   RecurringBill,
   SplitChild,
@@ -90,6 +91,8 @@ export const api = {
     memo?: string | null;
     cleared?: boolean;
     flagged?: boolean;
+    needsReview?: boolean;
+    sourceOverride?: string | null;
   }) => {
     // The Rust handler can't distinguish a missing field from a null one over
     // JSON, so it uses sentinels: "" clears a nullable string, 0 clears a
@@ -103,10 +106,31 @@ export const api = {
     if (args.memo !== undefined) wire.memo = args.memo ?? "";
     if (args.cleared !== undefined) wire.cleared = args.cleared;
     if (args.flagged !== undefined) wire.flagged = args.flagged;
+    if (args.needsReview !== undefined) wire.needsReview = args.needsReview;
+    if (args.sourceOverride !== undefined) wire.sourceOverride = args.sourceOverride ?? "";
     return invoke<void>("update_transaction", wire);
   },
   deleteTransaction: (id: number) =>
     invoke<void>("delete_transaction", { id }),
+  restoreTransactions: (txns: Transaction[]) =>
+    invoke<number[]>("restore_transactions", {
+      txns: txns.map((t) => ({
+        account_id: t.account_id,
+        date: t.date,
+        description: t.description,
+        title: t.title,
+        category_id: t.category_id,
+        amount: t.amount,
+        memo: t.memo,
+        cleared: t.cleared,
+        flagged: t.flagged,
+        needs_review: t.needs_review,
+        from_bill_id: t.from_bill_id,
+        from_budget_key: t.from_budget_key,
+        import_batch_id: t.import_batch_id,
+        source_override: t.source_override,
+      })),
+    }),
   markReviewed: (ids: number[]) =>
     invoke<number>("mark_reviewed", { ids }),
   simplifyDescriptions: () =>

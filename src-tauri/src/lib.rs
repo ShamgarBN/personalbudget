@@ -55,6 +55,7 @@ pub fn run() {
             commands::transactions::create_transaction,
             commands::transactions::update_transaction,
             commands::transactions::delete_transaction,
+            commands::transactions::restore_transactions,
             commands::transactions::mark_reviewed,
             commands::transactions::simplify_descriptions,
             commands::transactions::split_transaction,

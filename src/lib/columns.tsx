@@ -4,11 +4,13 @@ import { useCallback, useEffect, useRef, useState } from "react";
 /// fixed set so widths persist coherently across the Ledger and the
 /// per-account views (Bank Account, Credit Card, Savings).
 export type LedgerColumnId =
+  | "sel"
   | "date"
   | "account"
   | "description"
   | "memo"
   | "category"
+  | "source"
   | "amount"
   | "running"
   | "flags"
@@ -19,14 +21,16 @@ export type ColumnWidths = Partial<Record<LedgerColumnId, number>>;
 const STORAGE_KEY = "family-budget:ledger-col-widths";
 
 export const DEFAULT_WIDTHS: Record<LedgerColumnId, number> = {
-  date: 110,
-  account: 130,
-  description: 260,
-  memo: 220,
-  category: 170,
-  amount: 110,
-  running: 120,
-  flags: 80,
+  sel: 34,
+  date: 120,
+  account: 110,
+  description: 240,
+  memo: 160,
+  category: 160,
+  source: 130,
+  amount: 105,
+  running: 115,
+  flags: 100,
   actions: 110,
 };
 
@@ -118,24 +122,34 @@ export function useColumnWidths(): {
   return { widthOf, startResize };
 }
 
-/// Drop-in <th> that supports drag-resizing on its right edge.
+/// Drop-in <th> that supports drag-resizing on its right edge. When
+/// `fluidTotal` is given (the sum of all column widths in the table), the
+/// stored pixel width becomes a *proportion* of the table instead of a hard
+/// size — the table always fits the window and columns share the space, with
+/// drag-resizing adjusting the shares.
 export function ResizableTh({
   colId,
   widthOf,
   startResize,
+  fluidTotal,
   className = "",
   children,
 }: {
   colId: LedgerColumnId;
   widthOf: (id: LedgerColumnId) => number;
   startResize: (id: LedgerColumnId, e: React.MouseEvent) => void;
+  fluidTotal?: number;
   className?: string;
   children?: React.ReactNode;
 }) {
   const w = widthOf(colId);
+  const style =
+    fluidTotal && fluidTotal > 0
+      ? { width: `${(w / fluidTotal) * 100}%` }
+      : { width: w, minWidth: w, maxWidth: w };
   return (
     <th
-      style={{ width: w, minWidth: w, maxWidth: w }}
+      style={style}
       className={`relative px-3 py-2 ${className}`}
     >
       {children}

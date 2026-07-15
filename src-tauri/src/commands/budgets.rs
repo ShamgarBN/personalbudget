@@ -21,6 +21,9 @@ pub struct BudgetSummaryRow {
     pub parent_name: Option<String>,
     /// "monthly" or "per_pay_period" — which window `spent` was measured over.
     pub budget_basis: String,
+    /// Whether the category is marked Budgeted in Settings. Unbudgeted
+    /// categories still appear (with their spend) so nothing is invisible.
+    pub is_budgeted: bool,
     pub allocated: f64,
     pub spent: f64,
     pub available: f64,
@@ -109,13 +112,14 @@ pub fn budget_summary(
     month_end: String,
 ) -> AppResult<BudgetSummary> {
     let conn = state.conn.lock();
-    // Only budgeted, non-protected, non-income, non-archived categories appear.
-    // Spend is measured per category over the window matching its basis:
+    // Every non-protected, non-income, non-archived category appears — budgeted
+    // or not — so the Budgets tab shows all spending. Spend is measured per
+    // category over the window matching its basis:
     //   per_pay_period -> [start, end)              (the selected pay period)
     //   monthly        -> [month_start, month_end)  (the calendar month it sits in)
     // No rollover: available is simply allocated - spent each period.
     let mut stmt = conn.prepare(
-        "SELECT c.id, c.name, c.parent_id, p.name AS parent_name, c.budget_basis, \
+        "SELECT c.id, c.name, c.parent_id, p.name AS parent_name, c.budget_basis, c.is_budgeted, \
                 COALESCE((SELECT SUM(amount) FROM budget_allocation \
                           WHERE category_id=c.id AND effective_from <= ?1 \
                             AND (effective_to IS NULL OR effective_to > ?1)), 0) AS allocated, \
@@ -127,7 +131,7 @@ pub fn budget_summary(
                             AND date >= ?4 AND date < ?5 AND amount < 0), 0) AS month_spent \
          FROM category c \
          LEFT JOIN category p ON p.id = c.parent_id \
-         WHERE c.archived = 0 AND c.is_protected = 0 AND c.is_income = 0 AND c.is_budgeted = 1 \
+         WHERE c.archived = 0 AND c.is_protected = 0 AND c.is_income = 0 \
          ORDER BY COALESCE(p.name, c.name), (c.parent_id IS NOT NULL), c.name",
     )?;
     let rows: Vec<BudgetSummaryRow> = stmt
@@ -135,9 +139,10 @@ pub fn budget_summary(
             rusqlite::params![start, start, end, month_start, month_end],
             |r| {
                 let basis: String = r.get(4)?;
-                let allocated: f64 = r.get(5)?;
-                let period_spent: f64 = r.get(6)?;
-                let month_spent: f64 = r.get(7)?;
+                let is_budgeted: bool = r.get::<_, i64>(5)? != 0;
+                let allocated: f64 = r.get(6)?;
+                let period_spent: f64 = r.get(7)?;
+                let month_spent: f64 = r.get(8)?;
                 let spent = if basis == "monthly" { month_spent } else { period_spent };
                 Ok(BudgetSummaryRow {
                     category_id: r.get(0)?,
@@ -145,6 +150,7 @@ pub fn budget_summary(
                     parent_id: r.get(2)?,
                     parent_name: r.get(3)?,
                     budget_basis: basis,
+                    is_budgeted,
                     allocated,
                     spent,
                     available: allocated - spent,

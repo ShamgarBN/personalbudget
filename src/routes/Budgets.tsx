@@ -79,12 +79,34 @@ export default function Budgets() {
     },
   });
 
+  // Setting an allocation on a not-yet-budgeted category promotes it to
+  // budgeted (same as ticking the checkbox in Settings) and stores the amount.
+  const startBudgeting = useMutation({
+    mutationFn: async (vars: { categoryId: number; amount: number }) => {
+      await api.updateCategory({ id: vars.categoryId, isBudgeted: true });
+      await api.upsertBudgetAllocation({
+        id: 0,
+        category_id: vars.categoryId,
+        amount: vars.amount,
+        effective_from: period?.start ?? todayISO(),
+        effective_to: null,
+      });
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["budget-summary"] });
+      qc.invalidateQueries({ queryKey: ["budget-allocations"] });
+      qc.invalidateQueries({ queryKey: ["categories"] });
+    },
+  });
+
   const rows = summary.data?.rows ?? [];
-  const ppRows = rows.filter((r) => r.budget_basis === "per_pay_period");
-  const moRows = rows.filter((r) => r.budget_basis === "monthly");
-  const totalAllocated = rows.reduce((s, r) => s + r.allocated, 0);
+  const budgeted = rows.filter((r) => r.is_budgeted);
+  const ppRows = budgeted.filter((r) => r.budget_basis === "per_pay_period");
+  const moRows = budgeted.filter((r) => r.budget_basis === "monthly");
+  const otherRows = rows.filter((r) => !r.is_budgeted);
+  const totalAllocated = budgeted.reduce((s, r) => s + r.allocated, 0);
   const totalSpent = rows.reduce((s, r) => s + r.spent, 0);
-  const overBudget = rows.filter((r) => r.available < 0).length;
+  const overBudget = budgeted.filter((r) => r.available < 0).length;
 
   return (
     <div className="p-6 space-y-4 text-gray-900">
@@ -135,15 +157,14 @@ export default function Budgets() {
           <div className="text-xs uppercase tracking-wide text-gray-600">Over budget</div>
           <div className={`text-lg font-semibold mt-1 ${overBudget > 0 ? "text-red-700" : "text-gray-900"}`}>
             {overBudget}
-            <span className="text-xs text-gray-700 font-normal ml-2">of {rows.length}</span>
+            <span className="text-xs text-gray-700 font-normal ml-2">of {budgeted.length}</span>
           </div>
         </div>
       </div>
 
       {rows.length === 0 ? (
         <div className="rounded-xl border border-gray-200 bg-white px-3 py-10 text-center text-sm text-gray-700">
-          No budgeted categories yet. In Settings, check <span className="font-medium">Budgeted</span>{" "}
-          next to the categories you want to track here.
+          No categories yet. Create categories in Settings and they'll all show up here.
         </div>
       ) : (
         <div className="space-y-4">
@@ -158,6 +179,12 @@ export default function Budgets() {
             subtitle={monthBounds.label}
             rows={moRows}
             onSave={(categoryId, amount) => upsert.mutate({ categoryId, amount })}
+          />
+          <BudgetSection
+            title="Not budgeted"
+            subtitle="Every other category — type an amount to start budgeting it"
+            rows={otherRows}
+            onSave={(categoryId, amount) => startBudgeting.mutate({ categoryId, amount })}
           />
         </div>
       )}
@@ -217,13 +244,19 @@ function BudgetSection({
                 <td className="px-3 py-2 text-right tabular-nums text-red-700">{fmtUSD(r.spent)}</td>
                 <td
                   className={`px-3 py-2 text-right tabular-nums ${
-                    r.available < 0 ? "text-red-700 font-medium" : "text-green-700"
+                    !r.is_budgeted
+                      ? "text-gray-400"
+                      : r.available < 0
+                        ? "text-red-700 font-medium"
+                        : "text-green-700"
                   }`}
                 >
-                  {fmtUSD(r.available)}
+                  {r.is_budgeted ? fmtUSD(r.available) : "—"}
                 </td>
                 <td className="px-3 py-2 w-32">
-                  <Bar used={Math.max(0, r.spent)} of={Math.max(r.allocated, r.spent, 1)} />
+                  {r.is_budgeted && (
+                    <Bar used={Math.max(0, r.spent)} of={Math.max(r.allocated, r.spent, 1)} />
+                  )}
                 </td>
               </tr>
             ))}

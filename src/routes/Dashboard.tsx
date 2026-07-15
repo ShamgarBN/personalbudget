@@ -328,6 +328,9 @@ export default function Dashboard() {
   const netWorthSeries = useQuery({
     queryKey: ["net-worth-monthly", 12],
     queryFn: () => api.netWorthMonthly(12),
+    // Savings isn't tracked in this tool anymore (v1.4) — recompute each
+    // month's total as bank + credit so every widget stays consistent.
+    select: (rows) => rows.map((m) => ({ ...m, total: m.checking + m.credit })),
   });
   const drift = useQuery({
     queryKey: ["category-drift", range.from, range.to],
@@ -378,7 +381,9 @@ export default function Dashboard() {
     }
     return out;
   }, [liveAccounts.data]);
-  const liveNetWorth = liveByKind.checking + liveByKind.savings + liveByKind.credit;
+  // Savings isn't tracked in this tool anymore (v1.4) — the household position
+  // is bank minus what's owed on the card.
+  const liveNetWorth = liveByKind.checking + liveByKind.credit;
 
   const upcoming14 = useMemo(() => projectUpcoming(bills.data ?? [], 14), [bills.data]);
   const upcoming7 = useMemo(() => projectUpcoming(bills.data ?? [], 7), [bills.data]);
@@ -391,8 +396,11 @@ export default function Dashboard() {
   // Pay-period burn from budget allocations (works for any period scope).
   const burn = useMemo(() => {
     if (!budgetSummary.data) return null;
-    const allocated = budgetSummary.data.rows.reduce((s, r) => s + r.allocated, 0);
-    const spent = budgetSummary.data.rows.reduce((s, r) => s + r.spent, 0);
+    // budget_summary now returns every category; the burn widget only tracks
+    // the ones actually being budgeted.
+    const budgetedRows = budgetSummary.data.rows.filter((r) => r.is_budgeted);
+    const allocated = budgetedRows.reduce((s, r) => s + r.allocated, 0);
+    const spent = budgetedRows.reduce((s, r) => s + r.spent, 0);
     return { allocated, spent };
   }, [budgetSummary.data]);
   const projectedEnd = useMemo(() => {
@@ -1157,15 +1165,6 @@ function NetWorthTrendWidget({
                     dataKey="checking"
                     name="Checking"
                     stroke="#0ea5e9"
-                    strokeWidth={2}
-                    dot={false}
-                    isAnimationActive={false}
-                  />
-                  <Line
-                    type="monotone"
-                    dataKey="savings"
-                    name="Savings"
-                    stroke="#16a34a"
                     strokeWidth={2}
                     dot={false}
                     isAnimationActive={false}

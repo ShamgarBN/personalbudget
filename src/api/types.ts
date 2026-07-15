@@ -37,8 +37,29 @@ export interface Transaction {
   split_of_id: number | null;
   from_bill_id: number | null;
   from_budget_key: string | null;
+  import_batch_id: number | null;
+  source_override: TxnSource | null;
   running_balance: number | null;
 }
+
+/// How a transaction entered the ledger. Derived from the row's links unless
+/// the user overrides it via the Source column menu.
+export type TxnSource = "recurring" | "imported" | "manual" | "budgeted";
+
+export function txnSource(t: Transaction): TxnSource {
+  if (t.source_override) return t.source_override;
+  if (t.from_bill_id != null) return "recurring";
+  if (t.from_budget_key != null) return "budgeted";
+  if (t.import_batch_id != null) return "imported";
+  return "manual";
+}
+
+export const TXN_SOURCE_LABELS: Record<TxnSource, string> = {
+  recurring: "Recurring",
+  imported: "Imported CSV",
+  manual: "Manual",
+  budgeted: "Budgeted",
+};
 
 export interface NewTransaction {
   account_id: number;
@@ -210,6 +231,7 @@ export interface BudgetSummaryRow {
   parent_id: number | null;
   parent_name: string | null;
   budget_basis: "monthly" | "per_pay_period";
+  is_budgeted: boolean;
   allocated: number;
   spent: number;
   available: number;

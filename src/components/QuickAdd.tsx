@@ -46,7 +46,12 @@ export default function QuickAdd({
   onClose: () => void;
 }) {
   const qc = useQueryClient();
-  const accounts = useQuery({ queryKey: ["accounts"], queryFn: api.listAccounts });
+  const accountsQuery = useQuery({ queryKey: ["accounts"], queryFn: api.listAccounts });
+  // Savings isn't tracked in this tool anymore — only bank + credit are offered.
+  const accounts = useMemo(
+    () => ({ data: (accountsQuery.data ?? []).filter((a) => a.kind !== "savings") }),
+    [accountsQuery.data],
+  );
   const categories = useQuery({ queryKey: ["categories"], queryFn: api.listCategories });
   const categoryTree = useMemo(() => asTree(categories.data ?? []), [categories.data]);
 

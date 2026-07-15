@@ -2,27 +2,22 @@ import { useState } from "react";
 import { NavLink, Route, Routes, Navigate } from "react-router-dom";
 import Dashboard from "@/routes/Dashboard";
 import Ledger from "@/routes/Ledger";
-import AccountBank from "@/routes/AccountBank";
-import AccountCredit from "@/routes/AccountCredit";
-import AccountSavings from "@/routes/AccountSavings";
 import Settings from "@/routes/Settings";
 import Budgets from "@/routes/Budgets";
 import Bills from "@/routes/Bills";
 import Forecast from "@/routes/Forecast";
 import Goals from "@/routes/Goals";
 import QuickAdd, { useGlobalShortcut } from "@/components/QuickAdd";
+import UndoHost from "@/components/UndoHost";
 
-const sections: Array<{ path: string; label: string; section?: "main" | "accounts" }> = [
-  { path: "/dashboard", label: "Dashboard", section: "main" },
-  { path: "/ledger", label: "Ledger", section: "main" },
-  { path: "/bank-account", label: "Bank Account", section: "accounts" },
-  { path: "/credit-card", label: "Credit Card", section: "accounts" },
-  { path: "/savings", label: "Savings", section: "accounts" },
-  { path: "/budgets", label: "Budgets", section: "main" },
-  { path: "/bills", label: "Recurring Transactions", section: "main" },
-  { path: "/forecast", label: "Forecast", section: "main" },
-  { path: "/goals", label: "Goals", section: "main" },
-  { path: "/settings", label: "Settings", section: "main" },
+const sections: Array<{ path: string; label: string }> = [
+  { path: "/dashboard", label: "Dashboard" },
+  { path: "/ledger", label: "Ledger" },
+  { path: "/budgets", label: "Budgets" },
+  { path: "/bills", label: "Recurring Transactions" },
+  { path: "/forecast", label: "Forecast" },
+  { path: "/goals", label: "Goals" },
+  { path: "/settings", label: "Settings" },
 ];
 
 export default function App() {
@@ -41,36 +36,21 @@ export default function App() {
           <kbd className="text-[10px] text-white/80">⌘N</kbd>
         </button>
         <nav className="flex flex-col gap-0.5">
-          {sections.map((s, i) => {
-            const prevSection = i > 0 ? sections[i - 1].section : undefined;
-            const showHeading = s.section !== prevSection;
-            return (
-              <div key={s.path}>
-                {showHeading && s.section === "accounts" && (
-                  <div className="px-3 pt-3 pb-1 text-[10px] uppercase tracking-wider text-gray-500 font-semibold">
-                    Accounts
-                  </div>
-                )}
-                {showHeading && s.section === "main" && i > 0 && (
-                  <div className="px-3 pt-3 pb-1 text-[10px] uppercase tracking-wider text-gray-500 font-semibold">
-                    Planning
-                  </div>
-                )}
-                <NavLink
-                  to={s.path}
-                  className={({ isActive }) =>
-                    `block px-3 py-1.5 text-sm rounded-md transition-colors ${
-                      isActive
-                        ? "bg-gray-200 text-gray-900 font-medium"
-                        : "text-gray-700 hover:bg-gray-100"
-                    }`
-                  }
-                >
-                  {s.label}
-                </NavLink>
-              </div>
-            );
-          })}
+          {sections.map((s) => (
+            <NavLink
+              key={s.path}
+              to={s.path}
+              className={({ isActive }) =>
+                `block px-3 py-1.5 text-sm rounded-md transition-colors ${
+                  isActive
+                    ? "bg-gray-200 text-gray-900 font-medium"
+                    : "text-gray-700 hover:bg-gray-100"
+                }`
+              }
+            >
+              {s.label}
+            </NavLink>
+          ))}
         </nav>
       </aside>
       <main className="flex-1 overflow-auto bg-white">
@@ -78,9 +58,10 @@ export default function App() {
           <Route path="/" element={<Navigate to="/dashboard" replace />} />
           <Route path="/dashboard" element={<Dashboard />} />
           <Route path="/ledger" element={<Ledger />} />
-          <Route path="/bank-account" element={<AccountBank />} />
-          <Route path="/credit-card" element={<AccountCredit />} />
-          <Route path="/savings" element={<AccountSavings />} />
+          {/* The per-account tabs folded into the unified Ledger in v1.4. */}
+          <Route path="/bank-account" element={<Navigate to="/ledger" replace />} />
+          <Route path="/credit-card" element={<Navigate to="/ledger" replace />} />
+          <Route path="/savings" element={<Navigate to="/ledger" replace />} />
           <Route path="/budgets" element={<Budgets />} />
           <Route path="/bills" element={<Bills />} />
           <Route path="/forecast" element={<Forecast />} />
@@ -89,6 +70,7 @@ export default function App() {
         </Routes>
       </main>
       <QuickAdd open={quickAdd} onClose={() => setQuickAdd(false)} />
+      <UndoHost />
     </div>
   );
 }

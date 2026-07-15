@@ -15,6 +15,7 @@ interface OverrideState {
   set: (key: string, amount: number) => void;
   clear: (key: string) => void;
   dismiss: (key: string) => void;
+  undismiss: (key: string) => void;
 }
 
 export const useGhostOverrides = create<OverrideState>()(
@@ -35,6 +36,13 @@ export const useGhostOverrides = create<OverrideState>()(
           const amounts = { ...s.amounts };
           delete amounts[key];
           return { amounts, dismissed: { ...s.dismissed, [key]: true } };
+        }),
+      // Bring a dismissed occurrence back (the Undo path for a ghost delete).
+      undismiss: (key) =>
+        set((s) => {
+          const dismissed = { ...s.dismissed };
+          delete dismissed[key];
+          return { dismissed };
         }),
     }),
     { name: "family-budget:ghost-overrides-v1" },

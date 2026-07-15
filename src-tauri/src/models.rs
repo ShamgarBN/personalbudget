@@ -48,6 +48,11 @@ pub struct Transaction {
     pub from_bill_id: Option<i64>,
     /// The budget projection this row was locked in from ("<catId>:<periodStart>").
     pub from_budget_key: Option<String>,
+    /// The CSV import batch that created this row, if any.
+    pub import_batch_id: Option<i64>,
+    /// Manual override for the ledger's Source column ("recurring" |
+    /// "imported" | "manual" | "budgeted"). NULL -> derived from the links above.
+    pub source_override: Option<String>,
     /// Account balance immediately after this transaction posted, computed
     /// over the full history for this account regardless of any active filter.
     /// Null for split children (their amounts roll up under the parent).
