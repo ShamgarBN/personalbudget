@@ -8,6 +8,8 @@ interface CollapseState {
   open: Record<string, boolean>;
   toggle: (key: string) => void;
   setOpen: (key: string, open: boolean) => void;
+  /// Bulk set — powers the Ledger's Expand all / Collapse all buttons.
+  setMany: (entries: Record<string, boolean>) => void;
 }
 
 export const useCollapseStore = create<CollapseState>()(
@@ -17,6 +19,7 @@ export const useCollapseStore = create<CollapseState>()(
       toggle: (key) =>
         set((s) => ({ open: { ...s.open, [key]: !(s.open[key] ?? false) } })),
       setOpen: (key, open) => set((s) => ({ open: { ...s.open, [key]: open } })),
+      setMany: (entries) => set((s) => ({ open: { ...s.open, ...entries } })),
     }),
     { name: "family-budget:collapse-v1" },
   ),

@@ -49,7 +49,7 @@ pub fn list_transactions(state: State<AppState>, filter: Option<TxnFilter>) -> A
          ) \
          SELECT t.id, t.account_id, t.date, t.description, t.title, t.category_id, c.name, \
                 t.amount, t.memo, t.cleared, t.flagged, t.needs_review, t.split_of_id, t.from_bill_id, t.from_budget_key, \
-                t.import_batch_id, t.source_override, r.bal \
+                t.import_batch_id, t.source_override, t.amount_color, r.bal \
          FROM txn t \
          LEFT JOIN category c ON c.id = t.category_id \
          LEFT JOIN running r ON r.id = t.id \
@@ -129,7 +129,8 @@ pub fn list_transactions(state: State<AppState>, filter: Option<TxnFilter>) -> A
                     from_budget_key: r.get(14)?,
                     import_batch_id: r.get(15)?,
                     source_override: r.get(16)?,
-                    running_balance: r.get(17)?,
+                    amount_color: r.get(17)?,
+                    running_balance: r.get(18)?,
                 })
             },
         )?
@@ -198,6 +199,7 @@ pub fn update_transaction(
     flagged: Option<bool>,
     needs_review: Option<bool>,
     source_override: Option<String>,
+    amount_color: Option<String>,
 ) -> AppResult<()> {
     let conn = state.conn.lock();
     let now = chrono::Utc::now().to_rfc3339();
@@ -247,6 +249,10 @@ pub fn update_transaction(
         let store: Option<String> = if v.is_empty() { None } else { Some(v) };
         conn.execute("UPDATE txn SET source_override=?, updated_at=? WHERE id=?", rusqlite::params![store, now, id])?;
     }
+    if let Some(v) = amount_color {
+        let store: Option<String> = if v.is_empty() { None } else { Some(v) };
+        conn.execute("UPDATE txn SET amount_color=?, updated_at=? WHERE id=?", rusqlite::params![store, now, id])?;
+    }
     Ok(())
 }
 
@@ -268,6 +274,7 @@ pub struct RestoreTxn {
     pub from_budget_key: Option<String>,
     pub import_batch_id: Option<i64>,
     pub source_override: Option<String>,
+    pub amount_color: Option<String>,
 }
 
 /// Re-insert previously deleted transactions (the Undo path for single and
@@ -281,8 +288,8 @@ pub fn restore_transactions(state: State<AppState>, txns: Vec<RestoreTxn>) -> Ap
     for t in &txns {
         tx.execute(
             "INSERT INTO txn (account_id, date, description, title, category_id, amount, memo, cleared, flagged, needs_review, \
-                              from_bill_id, from_budget_key, import_batch_id, source_override, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                              from_bill_id, from_budget_key, import_batch_id, source_override, amount_color, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             rusqlite::params![
                 t.account_id,
                 t.date,
@@ -298,6 +305,7 @@ pub fn restore_transactions(state: State<AppState>, txns: Vec<RestoreTxn>) -> Ap
                 t.from_budget_key,
                 t.import_batch_id,
                 t.source_override,
+                t.amount_color,
                 now,
                 now,
             ],
@@ -469,6 +477,7 @@ fn row_to_txn(r: &rusqlite::Row) -> rusqlite::Result<Transaction> {
         from_budget_key: r.get(14)?,
         import_batch_id: r.get(15)?,
         source_override: r.get(16)?,
+        amount_color: r.get(17)?,
         running_balance: None,
     })
 }
@@ -479,7 +488,7 @@ pub fn get_transaction(state: State<AppState>, id: i64) -> AppResult<TxnWithChil
     let parent = conn.query_row(
         "SELECT t.id, t.account_id, t.date, t.description, t.title, t.category_id, c.name, \
                 t.amount, t.memo, t.cleared, t.flagged, t.needs_review, t.split_of_id, t.from_bill_id, t.from_budget_key, \
-                t.import_batch_id, t.source_override \
+                t.import_batch_id, t.source_override, t.amount_color \
          FROM txn t LEFT JOIN category c ON c.id=t.category_id WHERE t.id=?",
         rusqlite::params![id],
         row_to_txn,
@@ -487,7 +496,7 @@ pub fn get_transaction(state: State<AppState>, id: i64) -> AppResult<TxnWithChil
     let mut stmt = conn.prepare(
         "SELECT t.id, t.account_id, t.date, t.description, t.title, t.category_id, c.name, \
                 t.amount, t.memo, t.cleared, t.flagged, t.needs_review, t.split_of_id, t.from_bill_id, t.from_budget_key, \
-                t.import_batch_id, t.source_override \
+                t.import_batch_id, t.source_override, t.amount_color \
          FROM txn t LEFT JOIN category c ON c.id=t.category_id \
          WHERE t.split_of_id=? ORDER BY t.id",
     )?;

@@ -1,12 +1,13 @@
-import { useMemo, useState, type ReactNode } from "react";
+import { Fragment, useMemo, useState, type ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "@/api";
 import { asTree, makeColorResolver, CategoryColorContext, useCategoryColor } from "@/lib/categories";
 import { ResizableTh, useColumnWidths, type LedgerColumnId } from "@/lib/columns";
 import { fmtDate, fmtUSD, todayISO } from "@/lib/formatting";
 import { projectOccurrences } from "@/lib/recurrence";
-import { useCollapsed } from "@/lib/collapse";
+import { useCollapsed, useCollapseStore } from "@/lib/collapse";
 import { useGhostOverrides } from "@/lib/ghostOverrides";
+import { useLedgerView, type RangeMode } from "@/lib/ledgerView";
 import { pushUndo } from "@/lib/undo";
 import { TXN_SOURCE_LABELS, txnSource, type PayPeriod, type Transaction, type TxnSource } from "@/api/types";
 import SplitModal from "@/components/SplitModal";
@@ -59,12 +60,6 @@ function addDaysISO(isoDate: string, n: number): string {
   return d.toISOString().slice(0, 10);
 }
 
-type RangeMode =
-  | { kind: "all" }
-  | { kind: "month"; year: number; month: number /* 1-12 */ }
-  | { kind: "year"; year: number }
-  | { kind: "custom"; from: string; to: string };
-
 const iso = (d: Date) => d.toISOString().slice(0, 10);
 
 function rangeBounds(mode: RangeMode): { from: string; to: string; label: string } {
@@ -90,18 +85,19 @@ function rangeBounds(mode: RangeMode): { from: string; to: string; label: string
 export default function Ledger() {
   const qc = useQueryClient();
   const today = new Date();
-  const [mode, setMode] = useState<RangeMode>({ kind: "all" });
-  const [customFrom, setCustomFrom] = useState<string>(() => {
-    const d = new Date();
-    d.setMonth(d.getMonth() - 1);
-    return iso(d);
-  });
-  const [customTo, setCustomTo] = useState<string>(() => iso(today));
-  const [search, setSearch] = useState("");
-  const [groupByPP, setGroupByPP] = useState(true);
-  const [accountFilter, setAccountFilter] = useState<"all" | number>("all");
-  const [categoryFilter, setCategoryFilter] = useState<number | null>(null);
-  const [needsReviewOnly, setNeedsReviewOnly] = useState(false);
+  const todayIso = todayISO();
+  // View state persists across navigation and restarts — the page comes back
+  // looking exactly the way it was left.
+  const view = useLedgerView();
+  const { mode, customFrom, customTo, search, groupByPP, accountFilter, categoryFilter, needsReviewOnly } = view;
+  const setMode = (m: RangeMode) => view.set({ mode: m });
+  const setCustomFrom = (v: string) => view.set({ customFrom: v });
+  const setCustomTo = (v: string) => view.set({ customTo: v });
+  const setSearch = (v: string) => view.set({ search: v });
+  const setGroupByPP = (v: boolean) => view.set({ groupByPP: v });
+  const setAccountFilter = (v: "all" | number) => view.set({ accountFilter: v });
+  const setCategoryFilter = (v: number | null) => view.set({ categoryFilter: v });
+  const setNeedsReviewOnly = (v: boolean) => view.set({ needsReviewOnly: v });
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [splitTarget, setSplitTarget] = useState<Transaction | null>(null);
   const [importOpen, setImportOpen] = useState(false);
@@ -210,9 +206,11 @@ export default function Ledger() {
         (r) =>
           (accountFilter === "all" || r.account_id === accountFilter) &&
           (categoryFilter == null || r.category_id === categoryFilter) &&
-          (!needsReviewOnly || r.needs_review),
+          // Future-dated rows are inherently unreviewed — nothing in the
+          // future has been balanced against a statement yet.
+          (!needsReviewOnly || r.needs_review || r.date > todayIso),
       ),
-    [rows, accountFilter, categoryFilter, needsReviewOnly],
+    [rows, accountFilter, categoryFilter, needsReviewOnly, todayIso],
   );
   const total = useMemo(() => filteredRows.reduce((s, r) => s + r.amount, 0), [filteredRows]);
 
@@ -253,22 +251,29 @@ export default function Ledger() {
   const overrides = useGhostOverrides((s) => s.amounts);
   const dismissed = useGhostOverrides((s) => s.dismissed);
 
-  // Ghosts are hidden while searching or filtering to needs-review / a single
-  // category view that isn't theirs — they only make sense in the full flow.
-  const showGhosts =
-    !search &&
-    !needsReviewOnly &&
-    !!bankAccount &&
-    (accountFilter === "all" || accountFilter === bankAccount.id);
+  // Ghosts are hidden while searching or filtering to needs-review — they
+  // only make sense in the full flow. Recurring ghosts project for every
+  // visible account (bank AND credit); budget ghosts are bank-only.
+  const ghostAccountIds = useMemo(
+    () =>
+      new Set(
+        [...visibleAccountIds].filter(
+          (id) => accountFilter === "all" || id === accountFilter,
+        ),
+      ),
+    [visibleAccountIds, accountFilter],
+  );
+  const showGhosts = !search && !needsReviewOnly && ghostAccountIds.size > 0;
 
   const ghosts: LedgerItem[] = useMemo(() => {
-    if (!showGhosts || !bankAccount) return [];
+    if (!showGhosts) return [];
     const t = todayISO();
     const afterToday = addDaysISO(t, 1);
     const horizon = addDaysISO(t, 730); // 2-year forecast
 
     type Proj = {
       date: string;
+      accountId: number;
       amount: number;
       key: string; // override key
       description: string;
@@ -288,12 +293,13 @@ export default function Ledger() {
         rows.filter((r) => r.from_bill_id != null).map((r) => `${r.from_bill_id}:${r.date}`),
       );
       for (const o of projectOccurrences(bills.data ?? [], recStart, recEnd)) {
-        if (o.account_id !== bankAccount.id) continue;
+        if (!ghostAccountIds.has(o.account_id)) continue;
         if (materializedBill.has(`${o.bill_id}:${o.date}`)) continue;
         const key = `bill:${o.bill_id}:${o.date}`;
         if (dismissed[key]) continue; // user deleted this projected occurrence
         projected.push({
           date: o.date,
+          accountId: o.account_id,
           amount: overrides[key] ?? o.amount,
           key,
           description: o.name,
@@ -305,9 +311,13 @@ export default function Ledger() {
     }
 
     // --- Budget ghosts: per-pay-period budgeted categories, current + future ---
-    const allocRows = (currentBudget.data?.rows ?? []).filter(
-      (r) => r.is_budgeted && r.budget_basis === "per_pay_period" && r.allocated > 0.005,
-    );
+    // Bank-only: they model cash spending against the bank balance.
+    const allocRows =
+      bankAccount && ghostAccountIds.has(bankAccount.id)
+        ? (currentBudget.data?.rows ?? []).filter(
+            (r) => r.is_budgeted && r.budget_basis === "per_pay_period" && r.allocated > 0.005,
+          )
+        : [];
     if (allocRows.length > 0) {
       const materializedBudget = new Set(
         rows.filter((r) => r.from_budget_key != null).map((r) => r.from_budget_key as string),
@@ -327,6 +337,7 @@ export default function Ledger() {
           if (dismissed[key]) continue; // user deleted this projected item
           projected.push({
             date: ghostDate,
+            accountId: bankAccount!.id,
             amount: overrides[key] ?? base,
             key,
             description: `Budget · ${r.category_name}`,
@@ -347,7 +358,7 @@ export default function Ledger() {
       .filter((pj) => categoryFilter == null || pj.categoryId === categoryFilter)
       .map((pj, i) => ({
         id: -1 - i,
-        account_id: bankAccount.id,
+        account_id: pj.accountId,
         date: pj.date,
         description: pj.description,
         title: null,
@@ -363,6 +374,7 @@ export default function Ledger() {
         from_budget_key: pj.budgetKey ?? null,
         import_batch_id: null,
         source_override: null,
+        amount_color: null,
         running_balance: null,
         ghostBillId: pj.billId,
         ghostKey: pj.key,
@@ -373,6 +385,7 @@ export default function Ledger() {
   }, [
     showGhosts,
     bankAccount,
+    ghostAccountIds,
     range.from,
     range.to,
     rows,
@@ -410,7 +423,9 @@ export default function Ledger() {
         if (it.account_id === bankAccount?.id && it.running_balance != null) {
           bankRun = it.running_balance;
         }
-      } else {
+      } else if (it.account_id === bankAccount?.id) {
+        // Only bank ghosts move the bank running; credit ghosts show blank
+        // Running like real credit rows.
         if (bankRun == null) bankRun = bankAccount?.current_balance ?? 0;
         bankRun += it.amount;
         it.running_balance = bankRun;
@@ -419,17 +434,25 @@ export default function Ledger() {
     return { items: merged, endBankRunning: bankRun ?? bankAccount?.current_balance ?? 0 };
   }, [filteredRows, ghosts, bankAccount]);
 
-  // ---- Pinned Credit Card Payoff footer ----
-  // The payoff amount is the card's live balance (what a payment today would
-  // cost the bank account); the accordion itemizes the visible range's charges.
+  // ---- Credit Card Payoff ----
+  // Only ACTUAL charges (dated today or earlier) appear in the accordion —
+  // future-dated card rows are plans, not debt. The payoff amount is likewise
+  // the card's balance as of today, not inflated by future rows.
   const ccCharges = useMemo(
     () =>
-      rows.filter((r) => r.account_id === creditAccount?.id && r.amount < 0),
-    [rows, creditAccount],
+      rows.filter(
+        (r) => r.account_id === creditAccount?.id && r.amount < 0 && r.date <= todayIso,
+      ),
+    [rows, creditAccount, todayIso],
   );
-  const ccPayoff = creditAccount?.current_balance ?? 0; // negative = owed
+  const ccBalanceAsOf = useQuery({
+    queryKey: ["cc-balance-as-of", creditAccount?.id, todayIso],
+    queryFn: () => api.accountBalanceAsOf(creditAccount!.id, todayIso),
+    enabled: !!creditAccount,
+  });
+  const ccPayoff = ccBalanceAsOf.data ?? creditAccount?.current_balance ?? 0; // negative = owed
   const [ccExpanded, setCcExpanded] = useState(false);
-  const ccPinnedRunning = endBankRunning + ccPayoff;
+  const [ccSelected, setCcSelected] = useState<Set<number>>(new Set());
 
   // ---- Ghost lock-in / unlock / dismiss (all undoable) ----
   const materialize = useMutation({
@@ -593,10 +616,63 @@ export default function Ledger() {
     return { buckets: buckets.filter((b) => b.rows.length > 0), orphans };
   }, [groupByPP, payPeriods.data, items]);
 
+  // The pay-period bucket containing today — the payoff row renders right
+  // beneath it, and it's the one group open by default.
+  const currentBucket = useMemo(() => {
+    if (!groupedPP) return null;
+    return (
+      groupedPP.buckets.find((b) => b.period.start <= todayIso && todayIso < b.period.end) ??
+      null
+    );
+  }, [groupedPP, todayIso]);
+
+  // Bank running balance at the end of the current pay period — the payoff
+  // row's Running continues from there ("if we paid the card off now").
+  const ccAnchorRunning = useMemo(() => {
+    if (!currentBucket) return endBankRunning;
+    let run: number | null = null;
+    for (const it of items) {
+      if (it.date >= currentBucket.period.end) break;
+      if (it.account_id === bankAccount?.id && it.running_balance != null) {
+        run = it.running_balance;
+      }
+    }
+    return run ?? bankAccount?.current_balance ?? 0;
+  }, [currentBucket, items, bankAccount, endBankRunning]);
+
+  const ccBulkDelete = async () => {
+    const doomed = ccCharges.filter((c) => ccSelected.has(c.id));
+    if (doomed.length === 0) return;
+    if (!confirm(`Delete ${doomed.length} credit-card charge${doomed.length === 1 ? "" : "s"}?`)) return;
+    const snapshots = doomed.map((d) => ({ ...d }));
+    for (const d of doomed) {
+      await api.deleteTransaction(d.id);
+    }
+    pushUndo(`delete of ${doomed.length} credit-card charges`, async () => {
+      await api.restoreTransactions(snapshots);
+    });
+    setCcSelected(new Set());
+    invalidateAll();
+  };
+
+  // Expand all / Collapse all: bulk-set every year + pay-period group key.
+  const setManyCollapsed = useCollapseStore((s) => s.setMany);
+  const setAllGroups = (open: boolean) => {
+    const entries: Record<string, boolean> = { "ledger:pp:orphans": open };
+    if (groupedPP) {
+      for (const b of groupedPP.buckets) {
+        entries[`ledger:year:${b.period.start.slice(0, 4)}`] = open;
+        entries[`ledger:pp:${b.period.start}`] = open;
+      }
+    }
+    setManyCollapsed(entries);
+  };
+
   const rowCtx: RowCtx = {
     categories: categoryTree,
     accountName: (id: number) => accountById[id]?.name ?? `#${id}`,
     bankAccountId: bankAccount?.id ?? -1,
+    today: todayIso,
     selected,
     toggleSelect,
     onEdit: editField,
@@ -804,6 +880,24 @@ export default function Ledger() {
           />
           Group by pay period
         </label>
+        {groupByPP && (
+          <div className="flex items-center gap-1">
+            <button
+              onClick={() => setAllGroups(true)}
+              className="px-2 py-1 text-xs rounded border border-gray-200 bg-white text-gray-700 hover:bg-gray-50"
+              title="Open every year and pay-period group"
+            >
+              Expand all
+            </button>
+            <button
+              onClick={() => setAllGroups(false)}
+              className="px-2 py-1 text-xs rounded border border-gray-200 bg-white text-gray-700 hover:bg-gray-50"
+              title="Close every year and pay-period group"
+            >
+              Collapse all
+            </button>
+          </div>
+        )}
         <div className="text-sm text-gray-700 ml-auto">
           {filteredRows.length.toLocaleString()} transactions ·{" "}
           <span className={`font-medium tabular-nums ${total < 0 ? "text-red-700" : "text-green-700"}`}>
@@ -927,11 +1021,9 @@ export default function Ledger() {
               // extend buckets two years out, so "last" would open the wrong
               // one). Keeping the rest collapsed keeps the mount cost flat
               // across "all time" views.
-              const t = todayISO();
-              const currentBucket =
-                groupedPP.buckets.find((b) => b.period.start <= t && t < b.period.end) ??
-                groupedPP.buckets[groupedPP.buckets.length - 1];
-              const curYear = t.slice(0, 4);
+              const openBucket =
+                currentBucket ?? groupedPP.buckets[groupedPP.buckets.length - 1];
+              const curYear = todayIso.slice(0, 4);
               // Group the pay-period buckets by calendar year (buckets are ASC).
               const years: Array<{ year: string; buckets: typeof groupedPP.buckets }> = [];
               for (const b of groupedPP.buckets) {
@@ -950,23 +1042,64 @@ export default function Ledger() {
                       (s, b) => s + b.rows.reduce((ss, r) => ss + r.amount, 0),
                       0,
                     );
+                    // The bank balance at the end of the year (last bank row
+                    // or bank ghost inside it) — shown in the year header.
+                    let yearRunning: number | null = null;
+                    for (const b of yg.buckets) {
+                      for (const r of b.rows) {
+                        if (r.account_id === bankAccount?.id && r.running_balance != null) {
+                          yearRunning = r.running_balance;
+                        }
+                      }
+                    }
                     return (
                       <YearGroup
                         key={yg.year}
                         year={yg.year}
                         total={yearTotal}
+                        running={yearRunning}
                         groupKey={`ledger:year:${yg.year}`}
                         defaultOpen={yg.year === curYear}
                       >
                         {yg.buckets.map((bucket) => (
-                          <PeriodBody
-                            key={bucket.period.start}
-                            label={bucket.period.label}
-                            rows={bucket.rows}
-                            groupKey={`ledger:pp:${bucket.period.start}`}
-                            ctx={rowCtx}
-                            defaultOpen={bucket === currentBucket}
-                          />
+                          <Fragment key={bucket.period.start}>
+                            <PeriodBody
+                              label={bucket.period.label}
+                              rows={bucket.rows}
+                              groupKey={`ledger:pp:${bucket.period.start}`}
+                              ctx={rowCtx}
+                              defaultOpen={bucket === openBucket}
+                            />
+                            {bucket === currentBucket && creditAccount && (
+                              <CcPayoffBody
+                                variant="inline"
+                                accountName={creditAccount.name}
+                                payoff={ccPayoff}
+                                running={ccAnchorRunning + ccPayoff}
+                                charges={ccCharges}
+                                expanded={ccExpanded}
+                                onToggle={() => setCcExpanded((o) => !o)}
+                                selected={ccSelected}
+                                onToggleSelect={(id) =>
+                                  setCcSelected((s) => {
+                                    const next = new Set(s);
+                                    if (next.has(id)) next.delete(id);
+                                    else next.add(id);
+                                    return next;
+                                  })
+                                }
+                                onSelectAll={() =>
+                                  setCcSelected((s) =>
+                                    s.size === ccCharges.length
+                                      ? new Set()
+                                      : new Set(ccCharges.map((c) => c.id)),
+                                  )
+                                }
+                                onDeleteOne={deleteOne}
+                                onBulkDelete={ccBulkDelete}
+                              />
+                            )}
+                          </Fragment>
                         ))}
                       </YearGroup>
                     );
@@ -991,56 +1124,32 @@ export default function Ledger() {
               </tbody>
             );
           })()}
-          {creditAccount && (
-            <tfoot className={`${ccExpanded ? "" : "sticky bottom-0"} bg-amber-50 border-t-2 border-amber-200`}>
-              <tr>
-                <td className="px-3 py-2 text-amber-900 font-medium" colSpan={7}>
-                  <button
-                    type="button"
-                    onClick={() => setCcExpanded((o) => !o)}
-                    className="flex items-center gap-2 hover:text-black"
-                    title="Show the credit-card charges in this view"
-                  >
-                    <span className="inline-block w-3">{ccExpanded ? "▾" : "▸"}</span>
-                    Credit Card Payoff{" "}
-                    <span className="text-xs text-amber-700 font-normal normal-case">
-                      (projected — current {creditAccount.name} balance)
-                    </span>
-                  </button>
-                </td>
-                <td className={`px-3 py-2 text-right font-semibold tabular-nums ${ccPayoff < 0 ? "text-red-700" : "text-amber-900"}`}>
-                  {fmtUSD(ccPayoff)}
-                </td>
-                <td className={`px-3 py-2 text-right font-semibold tabular-nums ${ccPinnedRunning < 0 ? "text-red-700" : "text-amber-900"}`}>
-                  {fmtUSD(ccPinnedRunning)}
-                </td>
-                <td colSpan={2} />
-              </tr>
-              {ccExpanded &&
-                (ccCharges.length === 0 ? (
-                  <tr className="bg-amber-50/60">
-                    <td colSpan={NUM_COLS} className="px-3 py-2 pl-10 text-xs text-amber-800/70 italic">
-                      No credit-card charges in {range.label}.
-                    </td>
-                  </tr>
-                ) : (
-                  ccCharges.map((c) => (
-                    <tr key={`ccp-${c.id}`} className="bg-amber-50/50 text-xs text-amber-900/80">
-                      <td className="px-3 py-1" />
-                      <td className="px-3 py-1 pl-3 whitespace-nowrap">{fmtDate(c.date)}</td>
-                      <td className="px-3 py-1 truncate" colSpan={5}>
-                        <span className="line-clamp-1" title={c.description}>
-                          {c.title ?? c.description}
-                        </span>
-                      </td>
-                      <td className="px-3 py-1 text-right tabular-nums text-red-700">{fmtUSD(c.amount)}</td>
-                      <td className="px-3 py-1 text-right text-[10px] text-amber-700/60 italic whitespace-nowrap" colSpan={3}>
-                        on {creditAccount.name}
-                      </td>
-                    </tr>
-                  ))
-                ))}
-            </tfoot>
+          {creditAccount && (!groupByPP || !groupedPP || !currentBucket) && (
+            <CcPayoffBody
+              variant="footer"
+              accountName={creditAccount.name}
+              payoff={ccPayoff}
+              running={endBankRunning + ccPayoff}
+              charges={ccCharges}
+              expanded={ccExpanded}
+              onToggle={() => setCcExpanded((o) => !o)}
+              selected={ccSelected}
+              onToggleSelect={(id) =>
+                setCcSelected((s) => {
+                  const next = new Set(s);
+                  if (next.has(id)) next.delete(id);
+                  else next.add(id);
+                  return next;
+                })
+              }
+              onSelectAll={() =>
+                setCcSelected((s) =>
+                  s.size === ccCharges.length ? new Set() : new Set(ccCharges.map((c) => c.id)),
+                )
+              }
+              onDeleteOne={deleteOne}
+              onBulkDelete={ccBulkDelete}
+            />
           )}
         </table>
       </div>
@@ -1057,6 +1166,7 @@ type RowCtx = {
   categories: ReturnType<typeof asTree>;
   accountName: (id: number) => string;
   bankAccountId: number;
+  today: string;
   selected: Set<number>;
   toggleSelect: (id: number) => void;
   onEdit: (
@@ -1076,12 +1186,15 @@ type RowCtx = {
 function YearGroup({
   year,
   total,
+  running,
   groupKey,
   defaultOpen,
   children,
 }: {
   year: string;
   total: number;
+  /// Bank balance at the end of the year (last bank row/ghost inside it).
+  running: number | null;
   groupKey: string;
   defaultOpen: boolean;
   children: ReactNode;
@@ -1104,12 +1217,152 @@ function YearGroup({
           >
             {fmtUSD(total)}
           </td>
-          <td colSpan={3} />
+          <td
+            className="px-3 py-2 text-right text-sm font-semibold tabular-nums text-gray-800"
+            title={`Bank balance at the end of ${year}`}
+          >
+            {running != null ? fmtUSD(running) : ""}
+          </td>
+          <td colSpan={2} />
         </tr>
       </tbody>
       {open && children}
     </>
   );
+}
+
+// The Credit Card Payoff group: a header row (the payoff = the card's actual
+// balance as of today) plus, when expanded, this view's actual charges — each
+// deletable, with a select-all + bulk delete control row. Rendered inline
+// beneath the current pay period when grouping is on; falls back to a pinned
+// footer otherwise.
+function CcPayoffBody({
+  variant,
+  accountName,
+  payoff,
+  running,
+  charges,
+  expanded,
+  onToggle,
+  selected,
+  onToggleSelect,
+  onSelectAll,
+  onDeleteOne,
+  onBulkDelete,
+}: {
+  variant: "inline" | "footer";
+  accountName: string;
+  payoff: number;
+  running: number;
+  charges: Transaction[];
+  expanded: boolean;
+  onToggle: () => void;
+  selected: Set<number>;
+  onToggleSelect: (id: number) => void;
+  onSelectAll: () => void;
+  onDeleteOne: (t: Transaction) => void;
+  onBulkDelete: () => void;
+}) {
+  const nSelected = charges.filter((c) => selected.has(c.id)).length;
+  const content = (
+    <>
+      <tr>
+        <td className="px-3 py-2 text-amber-900 font-medium" colSpan={7}>
+          <button
+            type="button"
+            onClick={onToggle}
+            className="flex items-center gap-2 hover:text-black"
+            title="Show the actual charges on the card"
+          >
+            <span className="inline-block w-3">{expanded ? "▾" : "▸"}</span>
+            Credit Card Payoff{" "}
+            <span className="text-xs text-amber-700 font-normal normal-case">
+              ({accountName} balance as of today · {charges.length} charge{charges.length === 1 ? "" : "s"} in view)
+            </span>
+          </button>
+        </td>
+        <td className={`px-3 py-2 text-right font-semibold tabular-nums ${payoff < 0 ? "text-red-700" : "text-amber-900"}`}>
+          {fmtUSD(payoff)}
+        </td>
+        <td className={`px-3 py-2 text-right font-semibold tabular-nums ${running < 0 ? "text-red-700" : "text-amber-900"}`}>
+          {fmtUSD(running)}
+        </td>
+        <td colSpan={2} />
+      </tr>
+      {expanded && charges.length > 0 && (
+        <tr className="bg-amber-100/60 text-xs text-amber-900">
+          <td className="px-3 py-1 text-center">
+            <input
+              type="checkbox"
+              checked={charges.length > 0 && nSelected === charges.length}
+              onChange={onSelectAll}
+              title="Select all charges"
+              className="cursor-pointer align-middle"
+            />
+          </td>
+          <td colSpan={6} className="px-3 py-1">
+            {nSelected > 0 ? (
+              <button
+                onClick={onBulkDelete}
+                className="px-2 py-0.5 rounded bg-red-600 text-white text-[11px] font-medium hover:bg-red-700"
+              >
+                Delete selected ({nSelected})
+              </button>
+            ) : (
+              <span className="text-amber-800/70">select charges to delete several at once</span>
+            )}
+          </td>
+          <td colSpan={4} />
+        </tr>
+      )}
+      {expanded &&
+        (charges.length === 0 ? (
+          <tr className="bg-amber-50/60">
+            <td colSpan={NUM_COLS} className="px-3 py-2 pl-10 text-xs text-amber-800/70 italic">
+              No actual charges on the card in this view.
+            </td>
+          </tr>
+        ) : (
+          charges.map((c) => (
+            <tr key={`ccp-${c.id}`} className="bg-amber-50/50 text-xs text-amber-900/80">
+              <td className="px-3 py-1 text-center">
+                <input
+                  type="checkbox"
+                  checked={selected.has(c.id)}
+                  onChange={() => onToggleSelect(c.id)}
+                  className="cursor-pointer align-middle"
+                />
+              </td>
+              <td className="px-3 py-1 whitespace-nowrap">{fmtDate(c.date)}</td>
+              <td className="px-3 py-1 truncate" colSpan={5}>
+                <span className="line-clamp-1" title={c.description}>
+                  {c.title ?? c.description}
+                </span>
+              </td>
+              <td className="px-3 py-1 text-right tabular-nums text-red-700">{fmtUSD(c.amount)}</td>
+              <td colSpan={2} />
+              <td className="px-3 py-1 text-right whitespace-nowrap">
+                <button
+                  onClick={() => onDeleteOne(c)}
+                  title="Delete this charge (⌘Z to undo)"
+                  className="text-[11px] text-amber-800/80 hover:text-red-700"
+                >
+                  Delete
+                </button>
+              </td>
+            </tr>
+          ))
+        ))}
+    </>
+  );
+  if (variant === "footer") {
+    return (
+      <tfoot className={`${expanded ? "" : "sticky bottom-0"} bg-amber-50 border-t-2 border-amber-200`}>
+        {content}
+      </tfoot>
+    );
+  }
+  return <tbody className="bg-amber-50 border-y-2 border-amber-200">{content}</tbody>;
 }
 
 function PeriodBody({
@@ -1223,11 +1476,16 @@ function LedgerRow({ t, ctx }: { t: LedgerItem; ctx: RowCtx }) {
 
   const locked = isLockedProjection(t);
   const isChild = t.split_of_id !== null;
-  // Unreviewed rows are grayed + italic so they read as "not yet balanced".
-  const muted = t.needs_review;
+  // Unreviewed AND future-dated rows are grayed + italic — nothing in the
+  // future has been balanced against a statement yet.
+  const muted = t.needs_review || t.date > ctx.today;
+  const amountColor =
+    t.amount_color ??
+    colorOf(t.category_id) ??
+    (t.amount < 0 ? "#b91c1c" : t.amount > 0 ? "#15803d" : "#9ca3af");
   return (
     <tr
-      className={`border-t border-gray-100 hover:bg-gray-50 ${isChild ? "bg-gray-50/50" : ""} ${
+      className={`group border-t border-gray-100 hover:bg-gray-50 ${isChild ? "bg-gray-50/50" : ""} ${
         t.flagged ? "ring-1 ring-amber-300/40" : ""
       } ${muted ? "text-gray-400 italic" : ""}`}
     >
@@ -1293,7 +1551,7 @@ function LedgerRow({ t, ctx }: { t: LedgerItem; ctx: RowCtx }) {
       <td className="px-3 py-1.5">
         <select
           className="border border-gray-200 rounded px-1.5 py-0.5 text-xs bg-white w-full not-italic text-gray-700"
-          value={txnSource(t)}
+          value={txnSource(t, ctx.today)}
           onChange={(e) =>
             ctx.onEdit(
               t,
@@ -1312,16 +1570,15 @@ function LedgerRow({ t, ctx }: { t: LedgerItem; ctx: RowCtx }) {
         </select>
       </td>
       <td
-        className={`px-3 py-1.5 text-right tabular-nums truncate ${
-          t.amount < 0
-            ? muted
-              ? "text-red-400"
-              : "text-red-700"
-            : muted
-              ? "text-green-600/60"
-              : "text-green-700"
-        }`}
+        className="px-3 py-1.5 text-right tabular-nums overflow-hidden whitespace-nowrap"
+        style={{ color: amountColor, opacity: muted ? 0.55 : 1 }}
       >
+        <AmountColorDot
+          value={t.amount_color}
+          onPick={(c) =>
+            ctx.onEdit(t, "amount color change", { amountColor: c }, { amountColor: t.amount_color })
+          }
+        />
         <InlineNumber
           value={t.amount}
           onSave={(amount) => ctx.onEdit(t, "amount edit", { amount }, { amount: t.amount })}
@@ -1405,6 +1662,43 @@ function LedgerRow({ t, ctx }: { t: LedgerItem; ctx: RowCtx }) {
         )}
       </td>
     </tr>
+  );
+}
+
+// Hover-revealed color controls for the Amount cell: a swatch that opens the
+// native color picker, plus a reset when a custom color is set.
+function AmountColorDot({
+  value,
+  onPick,
+}: {
+  value: string | null;
+  onPick: (color: string | null) => void;
+}) {
+  return (
+    <span className="inline-flex items-center gap-0.5 align-middle mr-1.5 opacity-0 group-hover:opacity-100 transition-opacity not-italic">
+      <label
+        title={value ? "Custom amount color — click to change" : "Pick a custom color for this amount"}
+        className="relative inline-block w-3.5 h-3.5 rounded-full border border-gray-300 cursor-pointer overflow-hidden align-middle"
+        style={{ background: value ?? "#ffffff" }}
+      >
+        <input
+          type="color"
+          value={value ?? "#374151"}
+          onChange={(e) => onPick(e.target.value)}
+          className="absolute inset-0 opacity-0 cursor-pointer"
+        />
+      </label>
+      {value && (
+        <button
+          type="button"
+          onClick={() => onPick(null)}
+          title="Reset to the category color"
+          className="text-[10px] leading-none text-gray-400 hover:text-gray-700"
+        >
+          ×
+        </button>
+      )}
+    </span>
   );
 }
 

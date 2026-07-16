@@ -39,6 +39,7 @@ export interface Transaction {
   from_budget_key: string | null;
   import_batch_id: number | null;
   source_override: TxnSource | null;
+  amount_color: string | null;
   running_balance: number | null;
 }
 
@@ -46,11 +47,18 @@ export interface Transaction {
 /// the user overrides it via the Source column menu.
 export type TxnSource = "recurring" | "imported" | "manual" | "budgeted";
 
-export function txnSource(t: Transaction): TxnSource {
+/// Pass today's ISO date to keep the derivation honest for future rows: a
+/// future-dated transaction cannot have come from a bank CSV (banks only
+/// export the past) — those rows were hand-planned, so they read as Manual.
+/// An explicit user override always wins.
+export function txnSource(t: Transaction, today?: string): TxnSource {
   if (t.source_override) return t.source_override;
   if (t.from_bill_id != null) return "recurring";
   if (t.from_budget_key != null) return "budgeted";
-  if (t.import_batch_id != null) return "imported";
+  if (t.import_batch_id != null) {
+    if (today && t.date > today) return "manual";
+    return "imported";
+  }
   return "manual";
 }
 

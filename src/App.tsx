@@ -13,7 +13,7 @@ import UndoHost from "@/components/UndoHost";
 const sections: Array<{ path: string; label: string }> = [
   { path: "/dashboard", label: "Dashboard" },
   { path: "/ledger", label: "Ledger" },
-  { path: "/budgets", label: "Budgets" },
+  { path: "/budgets", label: "Budgets & Categories" },
   { path: "/bills", label: "Recurring Transactions" },
   { path: "/forecast", label: "Forecast" },
   { path: "/goals", label: "Goals" },

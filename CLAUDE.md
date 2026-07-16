@@ -3,7 +3,7 @@
 A single-household budgeting desktop app. Tauri 2 (Rust) backend + React/TypeScript frontend + local SQLite. Runs only on Sarah's Mac Mini; distributed as an adhoc-signed `.dmg`. Apple Silicon only.
 
 - **Repo:** https://github.com/ShamgarBN/personalbudget (branch `main`)
-- **Current version:** 1.4.0 (see `git tag` / GitHub Releases for history + per-release notes)
+- **Current version:** 1.5.0 (see `git tag` / GitHub Releases for history + per-release notes)
 - **Live DB:** `~/Library/Application Support/com.niemann.familybudget/budget.sqlite3` (SQLite, WAL). Never place the live DB in iCloud (WAL/SHM sync hazard). Backups are atomic `VACUUM INTO` snapshots.
 
 ## Build, verify, ship
@@ -25,14 +25,14 @@ pnpm build:dmg                                  # release DMG, copied to repo ro
 ## Architecture map
 
 Frontend (`src/`):
-- `routes/` — one file per tab: `Dashboard`, `Ledger` (THE page — see below), `Budgets`, `Bills` (titled "Recurring Transactions"), `Forecast`, `Goals`, `Settings`. `Import.tsx` is a **modal** hosted on the Ledger. The per-account tabs (`AccountBank`/`AccountCredit`/`AccountSavings`/`AccountLedger`) were **deleted in v1.4** — old routes redirect to `/ledger`.
+- `routes/` — one file per tab: `Dashboard`, `Ledger` (THE page — see below), `Budgets` (titled "Budgets & Categories" — since v1.5 it absorbs ALL category management: color/rename/basis/create/delete/archive; Settings only keeps schedules/backups/maintenance), `Bills` (titled "Recurring Transactions"), `Forecast`, `Goals`, `Settings`. `Import.tsx` is a **modal** hosted on the Ledger. The per-account tabs (`AccountBank`/`AccountCredit`/`AccountSavings`/`AccountLedger`) were **deleted in v1.4** — old routes redirect to `/ledger`.
 - `api/index.ts` + `api/types.ts` — all `invoke()` wrappers and shared DTOs. Tauri maps JS camelCase args → Rust snake_case params. `types.ts` also has `txnSource()` — derives a row's Source (recurring | imported | manual | budgeted) from `from_bill_id`/`from_budget_key`/`import_batch_id`, unless `source_override` is set.
-- `lib/` — `formatting`, `categories` (tree + `makeColorResolver` + `CategoryColorContext`), `columns` (resizable ledger columns; pass `fluidTotal` to `ResizableTh` for proportional fit-to-window sizing), `recurrence` (shared occurrence math, mirrors Rust), `collapse` (zustand+localStorage persistent group open/closed state), `ghostOverrides` (zustand+localStorage: per-projection amount edits + dismissals + `undismiss`), `undo` (in-memory global undo stack — see below).
+- `lib/` — `formatting`, `categories` (tree + `makeColorResolver` + `CategoryColorContext`), `columns` (resizable ledger columns; pass `fluidTotal` to `ResizableTh` for proportional fit-to-window sizing), `recurrence` (shared occurrence math, mirrors Rust), `collapse` (zustand+localStorage persistent group open/closed state), `ghostOverrides` (zustand+localStorage: per-projection amount edits + dismissals + `undismiss`), `ledgerView` (zustand+localStorage: the Ledger's range/filters/search/grouping, so the page looks the way it was left), `undo` (in-memory global undo stack — see below).
 - `components/UndoHost.tsx` — global ⌘Z handler + "Undid …" toast, mounted once in `App`. Steps aside while a text input is focused (native undo wins).
 
 Backend (`src-tauri/src/`):
 - `commands/` — grouped by feature (`transactions`, `accounts`, `categories`, `budgets`, `bills`, `goals`, `pay_periods`, `dashboard`, `imp`, `legacy_import`, `forecast_cmd`, `backup`, `export`). Register new commands in `lib.rs`.
-- `pay_period.rs` — cadence math (has unit tests). `forecast.rs` — projection engine. `parsers/` — per-bank CSV adapters (BoA checking, Apple Card, Capital One savings) + legacy-app importer. `migrations/` — refinery, `V1`..`V9` (V9 = `txn.source_override`).
+- `pay_period.rs` — cadence math (has unit tests). `forecast.rs` — projection engine. `parsers/` — per-bank CSV adapters (BoA checking, Apple Card, Capital One savings) + legacy-app importer. `migrations/` — refinery, `V1`..`V10` (V9 = `txn.source_override`, V10 = `txn.amount_color`).
 
 ## The unified Ledger (v1.4)
 
@@ -47,6 +47,15 @@ One page for everything, modeled on Sarah's spreadsheet (bank + credit interleav
 - **Global undo (⌘Z)**: field edits, category/source changes, clear/flag toggles, review, deletes (single + bulk, restored via `restore_transactions` command with full field snapshot), ghost lock-in/unlock/dismiss/amount edits. In-memory only; doesn't survive restart.
 - Unreviewed rows render gray + italic; ghosts gray + italic + dashed. Default view is **All time** with only the current year + current pay period expanded (mount cost: never render all rows expanded — stateful inline editors freeze the tab).
 - Table is `tableLayout: fixed; width: 100%` with proportional column widths → resizes to fit the window; drag-resize adjusts shares.
+
+## v1.5 ledger behaviors (on top of v1.4)
+
+- **Recurring ghosts project for bank AND credit** accounts (savings never). Only bank ghosts move the Running; credit ghosts show blank Running. Budget ghosts stay bank-only.
+- **Future-dated real rows** render gray+italic (like unreviewed), count under the "Needs review only" filter, and `txnSource(t, today)` never reports a future row as "Imported CSV" (impossible — banks export the past); it falls back to Manual unless overridden.
+- **Amount cell color** = `txn.amount_color` override ?? category color ?? red/green. Hover the cell for the color-dot picker + reset (undoable).
+- **Credit Card Payoff** renders inline directly beneath the current pay period's group (falls back to a pinned footer when grouping is off or no current period is in view). Payoff = `account_balance_as_of(credit, today)` — actual balance, not inflated by future rows. The accordion lists only actual (≤ today) charges, each deletable, with select-all + bulk delete. All undoable.
+- **Year headers** show the year-end bank running balance to the right of the year total.
+- **Expand all / Collapse all** buttons bulk-set every year+period group (`useCollapseStore.setMany`).
 
 ## Domain concepts / conventions
 

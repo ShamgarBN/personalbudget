@@ -93,6 +93,7 @@ export const api = {
     flagged?: boolean;
     needsReview?: boolean;
     sourceOverride?: string | null;
+    amountColor?: string | null;
   }) => {
     // The Rust handler can't distinguish a missing field from a null one over
     // JSON, so it uses sentinels: "" clears a nullable string, 0 clears a
@@ -108,6 +109,7 @@ export const api = {
     if (args.flagged !== undefined) wire.flagged = args.flagged;
     if (args.needsReview !== undefined) wire.needsReview = args.needsReview;
     if (args.sourceOverride !== undefined) wire.sourceOverride = args.sourceOverride ?? "";
+    if (args.amountColor !== undefined) wire.amountColor = args.amountColor ?? "";
     return invoke<void>("update_transaction", wire);
   },
   deleteTransaction: (id: number) =>
@@ -129,6 +131,7 @@ export const api = {
         from_budget_key: t.from_budget_key,
         import_batch_id: t.import_batch_id,
         source_override: t.source_override,
+        amount_color: t.amount_color,
       })),
     }),
   markReviewed: (ids: number[]) =>

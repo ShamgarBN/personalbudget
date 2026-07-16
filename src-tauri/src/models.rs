@@ -53,6 +53,8 @@ pub struct Transaction {
     /// Manual override for the ledger's Source column ("recurring" |
     /// "imported" | "manual" | "budgeted"). NULL -> derived from the links above.
     pub source_override: Option<String>,
+    /// Custom text color for the Amount cell (hex). NULL -> category color.
+    pub amount_color: Option<String>,
     /// Account balance immediately after this transaction posted, computed
     /// over the full history for this account regardless of any active filter.
     /// Null for split children (their amounts roll up under the parent).
