@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "@/api";
 import { asTree } from "@/lib/categories";
@@ -63,7 +63,11 @@ function describeCadence(b: RecurringBill): string {
   return base;
 }
 
-export default function Bills() {
+export default function RecurringPanel({
+  initialEditBillId = null,
+}: {
+  initialEditBillId?: number | null;
+}) {
   const qc = useQueryClient();
   const bills = useQuery({ queryKey: ["recurring-bills"], queryFn: api.listRecurringBills });
   const accounts = useQuery({ queryKey: ["accounts"], queryFn: api.listAccounts });
@@ -127,6 +131,18 @@ export default function Bills() {
     setDraft(b);
   };
 
+  // When launched from a ledger ghost row's "Edit…", open that bill's editor
+  // as soon as the list arrives (once).
+  const openedInitial = useRef(false);
+  useEffect(() => {
+    if (openedInitial.current || initialEditBillId == null) return;
+    const b = (bills.data ?? []).find((x) => x.id === initialEditBillId);
+    if (b) {
+      openedInitial.current = true;
+      openEditor(b);
+    }
+  }, [bills.data, initialEditBillId]);
+
   const save = useMutation({
     mutationFn: (b: RecurringBill) => api.upsertRecurringBill(b),
     onSuccess: () => {
@@ -146,7 +162,7 @@ export default function Bills() {
     .reduce((s, b) => s + b.amount * monthlyMultiplier(b), 0);
 
   return (
-    <div className="p-6 space-y-4">
+    <div className="space-y-4">
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-semibold">Recurring Transactions</h1>
         <div className="text-sm text-gray-700">

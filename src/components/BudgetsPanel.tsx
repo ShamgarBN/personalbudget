@@ -9,7 +9,7 @@ import type { BudgetSummaryRow, Category } from "@/api/types";
 // name, budget basis, allocation, and lifecycle (create/delete/archive).
 // Sections: per pay period / per month (budgeted), everything else (typing an
 // amount promotes it to budgeted), income & special, archived.
-export default function Budgets() {
+export default function BudgetsPanel() {
   const qc = useQueryClient();
   const [activePeriod, setActivePeriod] = useState<number>(0);
 
@@ -188,7 +188,7 @@ export default function Budgets() {
   };
 
   return (
-    <div className="p-6 space-y-4 text-gray-900">
+    <div className="space-y-4 text-gray-900">
       <div className="flex items-center justify-between flex-wrap gap-3">
         <div>
           <h1 className="text-2xl font-semibold text-gray-900">Budgets & Categories</h1>

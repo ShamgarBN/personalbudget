@@ -3,7 +3,7 @@
 A single-household budgeting desktop app. Tauri 2 (Rust) backend + React/TypeScript frontend + local SQLite. Runs only on Sarah's Mac Mini; distributed as an adhoc-signed `.dmg`. Apple Silicon only.
 
 - **Repo:** https://github.com/ShamgarBN/personalbudget (branch `main`)
-- **Current version:** 1.5.2 (see `git tag` / GitHub Releases for history + per-release notes)
+- **Current version:** 1.6.0 (see `git tag` / GitHub Releases for history + per-release notes)
 - **Live DB:** `~/Library/Application Support/com.niemann.familybudget/budget.sqlite3` (SQLite, WAL). Never place the live DB in iCloud (WAL/SHM sync hazard). Backups are atomic `VACUUM INTO` snapshots.
 
 ## Build, verify, ship
@@ -25,7 +25,7 @@ pnpm build:dmg                                  # release DMG, copied to repo ro
 ## Architecture map
 
 Frontend (`src/`):
-- `routes/` — one file per tab: `Dashboard`, `Ledger` (THE page — see below), `Budgets` (titled "Budgets & Categories" — since v1.5 it absorbs ALL category management: color/rename/basis/create/delete/archive; Settings only keeps schedules/backups/maintenance), `Bills` (titled "Recurring Transactions"), `Forecast`, `Goals`, `Settings`. `Import.tsx` is a **modal** hosted on the Ledger. The per-account tabs (`AccountBank`/`AccountCredit`/`AccountSavings`/`AccountLedger`) were **deleted in v1.4** — old routes redirect to `/ledger`.
+- `routes/` — one file per tab: `Dashboard`, `Ledger` (THE page — see below), `Forecast`, `Goals`, `Settings`. Since **v1.6** Budgets & Categories and Recurring Transactions are **modals on the Ledger** (`components/BudgetsPanel.tsx`, `components/RecurringPanel.tsx` — the former routes redirect to `/ledger`, as do the v1.4-removed account tabs). `Import.tsx` is a **modal** hosted on the Ledger.
 - `api/index.ts` + `api/types.ts` — all `invoke()` wrappers and shared DTOs. Tauri maps JS camelCase args → Rust snake_case params. `types.ts` also has `txnSource()` — derives a row's Source (recurring | imported | manual | budgeted) from `from_bill_id`/`from_budget_key`/`import_batch_id`, unless `source_override` is set.
 - `lib/` — `formatting`, `categories` (tree + `makeColorResolver` + `CategoryColorContext`), `columns` (resizable ledger columns; pass `fluidTotal` to `ResizableTh` for proportional fit-to-window sizing), `recurrence` (shared occurrence math, mirrors Rust), `collapse` (zustand+localStorage persistent group open/closed state), `ghostOverrides` (zustand+localStorage: per-projection amount edits + dismissals + `undismiss`), `ledgerView` (zustand+localStorage: the Ledger's range/filters/search/grouping, so the page looks the way it was left), `undo` (in-memory global undo stack — see below).
 - `components/UndoHost.tsx` — global ⌘Z handler + "Undid …" toast, mounted once in `App`. Steps aside while a text input is focused (native undo wins).
@@ -60,6 +60,13 @@ One page for everything, modeled on Sarah's spreadsheet (bank + credit interleav
 ## v1.5.2 — the infinite-loop hotfix (the "70GB" incident)
 
 `fixed_step_period` (weekly/biweekly) had an off-by-one: dates exactly N steps BEFORE the anchor got the period *ending* on them, so `generate`'s cursor stopped advancing — an infinite Vec-growing loop that held the DB mutex (app wedged, memory ballooned to tens of GB). Triggered by the Dashboard's 3-years-back pay-period window once Sarah's edited schedule put a biweekly anchor (2026-01-02) *after* its effective_from. Fixed by deleting the bogus `k -= 1`; `generate` also now has a cursor-progress guard and a 20,000-period cap that turn any future degeneracy into a clean error. Regression tests cover both.
+
+## v1.6 — the spreadsheet revamp (Ledger IS the app)
+
+- **Spreadsheet mode** (grouped + All accounts + no search/review filter): real credit-card rows leave the main flow. Each pay period renders its card payments as amber **"Credit Card Payment" dropdowns** — expanding one itemizes the charges that payment covered (FIFO attribution in `ccModel`; a planned FUTURE payment's dropdown shows what it *will* cover, but the projected payoff only credits payments ≤ today). Bank rows alone carry the Running (like Sarah's sheet). Filtering to the Credit Card account / searching / needs-review shows raw card rows again.
+- **SOON block**: each period's budget ghosts cluster into a collapsible "Soon — remaining budgets" subsection with an *edit budgets* link; every period's amounts are allocation − categorized spend **in that period** (her future-planned rows make future periods live too).
+- **Modals on the Ledger**: Budgets & Categories and Recurring panels open from toolbar buttons; recurring ghost rows have **Edit…** that opens the recurring editor prefilled (`RecurringPanel initialEditBillId`).
+- Nav is just Dashboard / Ledger / Forecast / Goals / Settings + the global Quick Add.
 
 ## Domain concepts / conventions
 

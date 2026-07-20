@@ -12,6 +12,8 @@ import { pushUndo } from "@/lib/undo";
 import { TXN_SOURCE_LABELS, txnSource, type PayPeriod, type Transaction, type TxnSource } from "@/api/types";
 import SplitModal from "@/components/SplitModal";
 import ImportModal from "@/routes/Import";
+import BudgetsPanel from "@/components/BudgetsPanel";
+import RecurringPanel from "@/components/RecurringPanel";
 
 // The one ledger: bank + credit card transactions interleaved, with the bank
 // account's running balance extended forward by projected "ghost" rows
@@ -101,6 +103,10 @@ export default function Ledger() {
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [splitTarget, setSplitTarget] = useState<Transaction | null>(null);
   const [importOpen, setImportOpen] = useState(false);
+  // Budgets & Categories and Recurring Transactions live in modals on the
+  // Ledger since v1.6 — no separate tabs.
+  const [panel, setPanel] = useState<null | "budgets" | "recurring">(null);
+  const [recurringEditId, setRecurringEditId] = useState<number | null>(null);
   const { widthOf, startResize } = useColumnWidths();
 
   // Persist the collapse state of the starting-balances section so once the
@@ -323,15 +329,32 @@ export default function Ledger() {
         rows.filter((r) => r.from_budget_key != null).map((r) => r.from_budget_key as string),
       );
       const periods = budgetPeriods.data ?? [];
-      periods.forEach((p, pi) => {
+      // Spend per (category, period) computed from every categorized row —
+      // future-dated planned rows included — so each period's SOON amount is
+      // the REMAINING budget for that specific period, recalculating live as
+      // transactions get categorized (Sarah's ask).
+      const spendByCatPeriod = new Map<string, number>();
+      if (periods.length > 0) {
+        const firstStart = periods[0].start;
+        const lastEnd = periods[periods.length - 1].end;
+        for (const r2 of rows) {
+          if (r2.amount >= 0 || r2.split_of_id != null || r2.category_id == null) continue;
+          if (r2.date < firstStart || r2.date >= lastEnd) continue;
+          const p = periods.find((pp) => pp.start <= r2.date && r2.date < pp.end);
+          if (!p) continue;
+          const k = `${r2.category_id}:${p.start}`;
+          spendByCatPeriod.set(k, (spendByCatPeriod.get(k) ?? 0) - r2.amount);
+        }
+      }
+      periods.forEach((p) => {
         // Place the projection on the period's last day (end is exclusive).
         const ghostDate = addDaysISO(p.end, -1);
         if (ghostDate < t || ghostDate < range.from || ghostDate > range.to) return;
-        const isCurrent = pi === 0;
         for (const r of allocRows) {
           const budgetKey = `${r.category_id}:${p.start}`;
           if (materializedBudget.has(budgetKey)) continue;
-          const base = isCurrent ? -Math.max(0, r.allocated - r.spent) : -r.allocated;
+          const spent = spendByCatPeriod.get(budgetKey) ?? 0;
+          const base = -Math.max(0, r.allocated - spent);
           if (Math.abs(base) < 0.005) continue;
           const key = `budget:${budgetKey}`;
           if (dismissed[key]) continue; // user deleted this projected item
@@ -398,13 +421,85 @@ export default function Ledger() {
     categoryFilter,
   ]);
 
+  // ---- Credit Card model: FIFO attribution of charges to payments ----
+  // Walks every card row in date order. Each payment consumes the oldest
+  // outstanding charges; a charge belongs to the payment that covers its last
+  // dollar. What's left uncovered (and dated ≤ today) is the projected payoff.
+  // This powers the per-pay-period "Credit Card Payment" dropdowns (each
+  // itemizing the charges that payment paid), mirroring Sarah's spreadsheet.
+  // Computed over the visible range; the default All-time view is exact.
+  const ccModel = useMemo(() => {
+    const empty = {
+      covered: new Map<number, Transaction[]>(),
+      payments: [] as Transaction[],
+      unpaid: [] as Transaction[],
+    };
+    if (!creditAccount) return empty;
+    const walk = (subset: Transaction[]) => {
+      const covered = new Map<number, Transaction[]>(); // payment id -> charges it paid off
+      const payments: Transaction[] = [];
+      // Pre-history debt in a negative opening balance is paid off first.
+      const queue: Array<{ t: Transaction | null; remaining: number }> = [];
+      if (creditAccount.opening_balance < -0.005) {
+        queue.push({ t: null, remaining: -creditAccount.opening_balance });
+      }
+      for (const r of subset) {
+        if (r.account_id !== creditAccount.id) continue;
+        if (r.amount < 0) {
+          queue.push({ t: r, remaining: -r.amount });
+        } else if (r.amount > 0) {
+          payments.push(r);
+          let pool = r.amount;
+          const got: Transaction[] = [];
+          while (pool > 0.005 && queue.length > 0) {
+            const head = queue[0];
+            const pay = Math.min(head.remaining, pool);
+            head.remaining -= pay;
+            pool -= pay;
+            if (head.remaining <= 0.005) {
+              if (head.t) got.push(head.t);
+              queue.shift();
+            }
+          }
+          covered.set(r.id, got);
+        }
+      }
+      return { covered, payments, queue };
+    };
+    // Full-timeline walk: powers every payment's dropdown, including PLANNED
+    // future payments (their dropdown shows the charges they'll cover).
+    const full = walk(rows);
+    // As-of-today walk: the projected payoff must only credit payments that
+    // have actually happened — future planned payments don't reduce it.
+    const actual = walk(rows.filter((r) => r.date <= todayIso));
+    const unpaid = actual.queue
+      .map((q) => q.t)
+      .filter((t): t is Transaction => t != null);
+    return { covered: full.covered, payments: full.payments, unpaid };
+  }, [rows, creditAccount, todayIso]);
+  const ccCharges = ccModel.unpaid;
+
+  // Spreadsheet mode (the default All-accounts view): real credit-card rows
+  // leave the main flow and live inside the per-period Credit Card Payment
+  // dropdowns instead — like the spreadsheet, where the bank-side payment row
+  // carries the ledger and the card charges nest under it. Credit GHOSTS
+  // (planned recurring card charges) stay visible inline. Filtering to the
+  // Credit Card account, searching, or needs-review shows raw card rows.
+  const spreadsheetMode =
+    groupByPP && accountFilter === "all" && !search && !needsReviewOnly;
+
   // Real rows + ghosts, in stable display order: by date, real before ghost on
   // the same day, then real rows by id and ghosts by their projection sequence.
   // The bank running balance is computed in one top-to-bottom pass — real bank
   // rows keep their authoritative backend running, ghosts continue from the
   // bank row above them, and credit rows are carried along without moving it.
   const { items, endBankRunning } = useMemo(() => {
-    const merged: LedgerItem[] = [...filteredRows.map((r) => ({ ...r })), ...ghosts];
+    // In spreadsheet mode real card rows render inside the per-period Credit
+    // Card Payment dropdowns, not the main flow.
+    const flowRows = spreadsheetMode
+      ? filteredRows.filter((r) => r.account_id !== creditAccount?.id)
+      : filteredRows;
+    const merged: LedgerItem[] = [...flowRows.map((r) => ({ ...r })), ...ghosts];
     merged.sort((a, b) => {
       if (a.date !== b.date) return a.date.localeCompare(b.date);
       const ag = isGhost(a);
@@ -432,35 +527,8 @@ export default function Ledger() {
       }
     }
     return { items: merged, endBankRunning: bankRun ?? bankAccount?.current_balance ?? 0 };
-  }, [filteredRows, ghosts, bankAccount]);
+  }, [filteredRows, ghosts, bankAccount, creditAccount, spreadsheetMode]);
 
-  // ---- Credit Card Payoff ----
-  // The accordion lists only the charges still making up the balance owed:
-  // actual (dated today or earlier), and not yet covered by payments. FIFO —
-  // payments pay off the oldest charges first, so once a payment posts, the
-  // charges it covered drop out of the list. (Computed over the visible
-  // range; the default All-time view sees the full history and is exact.)
-  const ccCharges = useMemo(() => {
-    if (!creditAccount) return [];
-    const actual = rows.filter(
-      (r) => r.account_id === creditAccount.id && r.date <= todayIso,
-    ); // rows are ASC by date
-    // Pool of money that has gone toward the card: payments/credits, less any
-    // pre-history debt in the opening balance (it gets paid off first).
-    let pool =
-      actual.filter((r) => r.amount > 0).reduce((s, r) => s + r.amount, 0) +
-      Math.min(0, creditAccount.opening_balance);
-    const unpaid: Transaction[] = [];
-    for (const c of actual) {
-      if (c.amount >= 0) continue;
-      if (pool >= -c.amount - 0.005) {
-        pool += c.amount; // fully covered by payments — paid off
-      } else {
-        unpaid.push(c);
-      }
-    }
-    return unpaid;
-  }, [rows, creditAccount, todayIso]);
   const ccBalanceAsOf = useQuery({
     queryKey: ["cc-balance-as-of", creditAccount?.id, todayIso],
     queryFn: () => api.accountBalanceAsOf(creditAccount!.id, todayIso),
@@ -689,6 +757,15 @@ export default function Ledger() {
     accountName: (id: number) => accountById[id]?.name ?? `#${id}`,
     bankAccountId: bankAccount?.id ?? -1,
     today: todayIso,
+    spreadsheetMode,
+    ccPaymentsIn: (start, end) =>
+      ccModel.payments.filter((p) => p.date >= start && p.date < end),
+    ccCoveredBy: (paymentId) => ccModel.covered.get(paymentId) ?? [],
+    onEditRecurring: (billId) => {
+      setRecurringEditId(billId);
+      setPanel("recurring");
+    },
+    onOpenBudgets: () => setPanel("budgets"),
     selected,
     toggleSelect,
     onEdit: editField,
@@ -779,6 +856,23 @@ export default function Ledger() {
             </>
           )}
           <div className="w-px h-6 bg-gray-200 mx-1" />
+          <button
+            onClick={() => setPanel("budgets")}
+            className="px-3 py-1.5 text-sm rounded-md border border-gray-200 bg-white text-gray-800 hover:bg-gray-50"
+            title="Budgets & Categories — allocations, colors, names, budget basis"
+          >
+            Budgets & Categories
+          </button>
+          <button
+            onClick={() => {
+              setRecurringEditId(null);
+              setPanel("recurring");
+            }}
+            className="px-3 py-1.5 text-sm rounded-md border border-gray-200 bg-white text-gray-800 hover:bg-gray-50"
+            title="Recurring transactions — the schedule feeding the projected rows"
+          >
+            Recurring
+          </button>
           <button
             onClick={() => setImportOpen(true)}
             className="px-3 py-1.5 text-sm rounded-md bg-gray-900 text-white hover:bg-gray-800"
@@ -1084,6 +1178,7 @@ export default function Ledger() {
                               rows={bucket.rows}
                               groupKey={`ledger:pp:${bucket.period.start}`}
                               ctx={rowCtx}
+                              period={bucket.period}
                               defaultOpen={bucket === openBucket}
                             />
                             {bucket === currentBucket && creditAccount && (
@@ -1174,6 +1269,38 @@ export default function Ledger() {
 
       {splitTarget && <SplitModal txn={splitTarget} onClose={() => setSplitTarget(null)} />}
       <ImportModal open={importOpen} onOpenChange={setImportOpen} />
+      {panel && (
+        <div
+          className="fixed inset-0 z-30 flex items-center justify-center bg-black/40"
+          onClick={() => {
+            setPanel(null);
+            setRecurringEditId(null);
+          }}
+        >
+          <div
+            className="bg-white rounded-xl shadow-xl w-[980px] max-w-[95vw] max-h-[88vh] overflow-auto p-6"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex justify-end">
+              <button
+                onClick={() => {
+                  setPanel(null);
+                  setRecurringEditId(null);
+                }}
+                className="text-gray-400 hover:text-gray-800 text-2xl leading-none -mt-2 -mr-2"
+                title="Close"
+              >
+                ×
+              </button>
+            </div>
+            {panel === "budgets" ? (
+              <BudgetsPanel />
+            ) : (
+              <RecurringPanel initialEditBillId={recurringEditId} />
+            )}
+          </div>
+        </div>
+      )}
     </div>
     </CategoryColorContext.Provider>
   );
@@ -1185,6 +1312,12 @@ type RowCtx = {
   accountName: (id: number) => string;
   bankAccountId: number;
   today: string;
+  /// Real credit rows fold into per-period Credit Card Payment dropdowns.
+  spreadsheetMode: boolean;
+  ccPaymentsIn: (start: string, end: string) => Transaction[];
+  ccCoveredBy: (paymentId: number) => Transaction[];
+  onEditRecurring: (billId: number) => void;
+  onOpenBudgets: () => void;
   selected: Set<number>;
   toggleSelect: (id: number) => void;
   onEdit: (
@@ -1346,46 +1479,13 @@ function CcPayoffBody({
           </tr>
         ) : (
           charges.map((c) => (
-            <tr key={`ccp-${c.id}`} className="bg-amber-50/50 text-xs text-amber-900/80">
-              <td className="px-3 py-1 text-center">
-                <input
-                  type="checkbox"
-                  checked={selected.has(c.id)}
-                  onChange={() => onToggleSelect(c.id)}
-                  className="cursor-pointer align-middle"
-                />
-              </td>
-              <td className="px-3 py-1 whitespace-nowrap">
-                <InlineDate
-                  value={c.date}
-                  onSave={(date) => onEdit(c, "date edit", { date }, { date: c.date })}
-                />
-              </td>
-              <td className="px-3 py-1 truncate" colSpan={5}>
-                <InlineText
-                  value={c.title ?? c.description}
-                  onSave={(v) =>
-                    onEdit(c, "description edit", { title: v || null }, { title: c.title })
-                  }
-                />
-              </td>
-              <td className="px-3 py-1 text-right tabular-nums text-red-700">
-                <InlineNumber
-                  value={c.amount}
-                  onSave={(amount) => onEdit(c, "amount edit", { amount }, { amount: c.amount })}
-                />
-              </td>
-              <td colSpan={2} />
-              <td className="px-3 py-1 text-right whitespace-nowrap">
-                <button
-                  onClick={() => onDeleteOne(c)}
-                  title="Delete this charge (⌘Z to undo)"
-                  className="text-[11px] text-amber-800/80 hover:text-red-700"
-                >
-                  Delete
-                </button>
-              </td>
-            </tr>
+            <CcChargeRow
+              key={`ccp-${c.id}`}
+              c={c}
+              onEdit={onEdit}
+              onDeleteOne={onDeleteOne}
+              selectable={{ checked: selected.has(c.id), onToggle: () => onToggleSelect(c.id) }}
+            />
           ))
         ))}
     </>
@@ -1405,16 +1505,31 @@ function PeriodBody({
   rows,
   groupKey,
   ctx,
+  period,
   defaultOpen = true,
 }: {
   label: string;
   rows: LedgerItem[];
   groupKey: string;
   ctx: RowCtx;
+  /// The pay period backing this group — enables the Credit Card Payment
+  /// dropdowns and the SOON budget block. Absent for the orphans bucket.
+  period?: PayPeriod;
   defaultOpen?: boolean;
 }) {
   const [open, toggle] = useCollapsed(groupKey, defaultOpen);
-  const total = rows.reduce((s, r) => s + r.amount, 0);
+  const [soonOpen, toggleSoon] = useCollapsed(`${groupKey}:soon`, true);
+  // Budget ghosts cluster into the collapsible SOON block at the period's
+  // end (Sarah's spreadsheet layout); everything else is the main flow.
+  const soonRows = rows.filter((r) => r.ghostBudgetKey != null);
+  const mainRows = rows.filter((r) => r.ghostBudgetKey == null);
+  const soonTotal = soonRows.reduce((s, r) => s + r.amount, 0);
+  // Card payments dated in this period, shown as expandable dropdowns
+  // (spreadsheet mode only — otherwise they render as ordinary rows).
+  const ccPayments =
+    ctx.spreadsheetMode && period ? ctx.ccPaymentsIn(period.start, period.end) : [];
+  const ccTotal = ccPayments.reduce((s, p) => s - p.amount, 0);
+  const total = rows.reduce((s, r) => s + r.amount, 0) + ccTotal;
   // Bank balance at the end of this pay period (last bank row/ghost in it).
   let periodRunning: number | null = null;
   for (const r of rows) {
@@ -1432,7 +1547,10 @@ function PeriodBody({
             className="flex items-center gap-2 hover:text-black"
           >
             <span className="inline-block w-3">{open ? "▾" : "▸"}</span>
-            {label} <span className="text-gray-500 normal-case font-normal">({rows.length})</span>
+            {label}{" "}
+            <span className="text-gray-500 normal-case font-normal">
+              ({rows.length + ccPayments.length})
+            </span>
           </button>
         </td>
         <td className={`px-3 py-1.5 text-right text-xs font-semibold tabular-nums ${total < 0 ? "text-red-700" : "text-green-700"}`}>
@@ -1446,8 +1564,149 @@ function PeriodBody({
         </td>
         <td colSpan={2} />
       </tr>
-      {open && rows.map((t) => <LedgerRow key={t.id} t={t} ctx={ctx} />)}
+      {open && mainRows.map((t) => <LedgerRow key={t.id} t={t} ctx={ctx} />)}
+      {open &&
+        ccPayments.map((p) => (
+          <CcPaymentGroup key={`ccpay-${p.id}`} payment={p} ctx={ctx} />
+        ))}
+      {open && soonRows.length > 0 && (
+        <>
+          <tr className="bg-blue-50/60 border-y border-blue-100 text-blue-900">
+            <td colSpan={7} className="px-3 py-1 text-[11px] font-semibold uppercase tracking-wide">
+              <span className="flex items-center gap-2">
+                <button type="button" onClick={toggleSoon} className="flex items-center gap-2 hover:text-black">
+                  <span className="inline-block w-3">{soonOpen ? "▾" : "▸"}</span>
+                  Soon — remaining budgets ({soonRows.length})
+                </button>
+                <button
+                  type="button"
+                  onClick={ctx.onOpenBudgets}
+                  className="normal-case font-normal text-[11px] text-blue-700/80 hover:text-blue-900 underline"
+                >
+                  edit budgets
+                </button>
+              </span>
+            </td>
+            <td className="px-3 py-1 text-right text-[11px] font-semibold tabular-nums text-red-700/80">
+              {fmtUSD(soonTotal)}
+            </td>
+            <td colSpan={3} />
+          </tr>
+          {soonOpen && soonRows.map((t) => <LedgerRow key={t.id} t={t} ctx={ctx} />)}
+        </>
+      )}
     </tbody>
+  );
+}
+
+// One credit-card payment rendered as an expandable dropdown: the parent row
+// shows the amount the bank paid; expanding it itemizes the charges that
+// payment covered (FIFO), each editable and deletable in place.
+function CcPaymentGroup({ payment, ctx }: { payment: Transaction; ctx: RowCtx }) {
+  const [open, toggle] = useCollapsed(`ledger:ccpay:${payment.id}`, false);
+  const charges = ctx.ccCoveredBy(payment.id);
+  return (
+    <>
+      <tr className="bg-amber-50 border-y border-amber-200 text-amber-900">
+        <td className="px-3 py-1.5" />
+        <td className="px-3 py-1.5 whitespace-nowrap">
+          <InlineDate
+            value={payment.date}
+            onSave={(date) => ctx.onEdit(payment, "date edit", { date }, { date: payment.date })}
+          />
+        </td>
+        <td className="px-3 py-1.5 truncate text-amber-800/80">Credit Card</td>
+        <td className="px-3 py-1.5 truncate" colSpan={4}>
+          <button type="button" onClick={toggle} className="flex items-center gap-2 hover:text-black font-medium">
+            <span className="inline-block w-3">{open ? "▾" : "▸"}</span>
+            Credit Card Payment
+            <span className="text-xs text-amber-700 font-normal">
+              — {payment.title ?? payment.description} · pays {charges.length} charge{charges.length === 1 ? "" : "s"}
+            </span>
+          </button>
+        </td>
+        <td className="px-3 py-1.5 text-right tabular-nums font-semibold text-red-700">
+          {fmtUSD(-payment.amount)}
+        </td>
+        <td className="px-3 py-1.5" />
+        <td className="px-3 py-1.5" />
+        <td className="px-3 py-1.5 text-right whitespace-nowrap">
+          <button
+            onClick={() => ctx.onDelete(payment)}
+            title="Delete this payment (⌘Z to undo)"
+            className="text-xs text-amber-800/80 hover:text-red-700"
+          >
+            Delete
+          </button>
+        </td>
+      </tr>
+      {open &&
+        (charges.length === 0 ? (
+          <tr className="bg-amber-50/50 text-xs text-amber-800/70">
+            <td colSpan={NUM_COLS} className="px-3 py-1.5 pl-12 italic">
+              No charges attributed to this payment (it covered older balance).
+            </td>
+          </tr>
+        ) : (
+          charges.map((c) => (
+            <CcChargeRow key={`ccc-${c.id}`} c={c} onEdit={ctx.onEdit} onDeleteOne={ctx.onDelete} />
+          ))
+        ))}
+    </>
+  );
+}
+
+// A single card charge inside a payment/payoff dropdown: inline-editable
+// date/description/amount, optional multi-select checkbox, delete.
+function CcChargeRow({
+  c,
+  onEdit,
+  onDeleteOne,
+  selectable,
+}: {
+  c: Transaction;
+  onEdit: RowCtx["onEdit"];
+  onDeleteOne: (t: Transaction) => void;
+  selectable?: { checked: boolean; onToggle: () => void };
+}) {
+  return (
+    <tr className="bg-amber-50/50 text-xs text-amber-900/80">
+      <td className="px-3 py-1 text-center">
+        {selectable && (
+          <input
+            type="checkbox"
+            checked={selectable.checked}
+            onChange={selectable.onToggle}
+            className="cursor-pointer align-middle"
+          />
+        )}
+      </td>
+      <td className="px-3 py-1 whitespace-nowrap">
+        <InlineDate value={c.date} onSave={(date) => onEdit(c, "date edit", { date }, { date: c.date })} />
+      </td>
+      <td className="px-3 py-1 truncate" colSpan={5}>
+        <InlineText
+          value={c.title ?? c.description}
+          onSave={(v) => onEdit(c, "description edit", { title: v || null }, { title: c.title })}
+        />
+      </td>
+      <td className="px-3 py-1 text-right tabular-nums text-red-700">
+        <InlineNumber
+          value={c.amount}
+          onSave={(amount) => onEdit(c, "amount edit", { amount }, { amount: c.amount })}
+        />
+      </td>
+      <td colSpan={2} />
+      <td className="px-3 py-1 text-right whitespace-nowrap">
+        <button
+          onClick={() => onDeleteOne(c)}
+          title="Delete this charge (⌘Z to undo)"
+          className="text-[11px] text-amber-800/80 hover:text-red-700"
+        >
+          Delete
+        </button>
+      </td>
+    </tr>
   );
 }
 
@@ -1516,6 +1775,16 @@ function LedgerRow({ t, ctx }: { t: LedgerItem; ctx: RowCtx }) {
             >
               Delete
             </button>
+            {t.ghostBillId != null && (
+              <button
+                type="button"
+                onClick={() => ctx.onEditRecurring(t.ghostBillId!)}
+                title="Edit this recurring transaction (name, amount, cadence…)"
+                className="text-xs not-italic text-gray-400 hover:text-black"
+              >
+                Edit…
+              </button>
+            )}
           </div>
         </td>
       </tr>

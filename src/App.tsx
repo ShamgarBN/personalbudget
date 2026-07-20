@@ -3,8 +3,6 @@ import { NavLink, Route, Routes, Navigate } from "react-router-dom";
 import Dashboard from "@/routes/Dashboard";
 import Ledger from "@/routes/Ledger";
 import Settings from "@/routes/Settings";
-import Budgets from "@/routes/Budgets";
-import Bills from "@/routes/Bills";
 import Forecast from "@/routes/Forecast";
 import Goals from "@/routes/Goals";
 import QuickAdd, { useGlobalShortcut } from "@/components/QuickAdd";
@@ -13,8 +11,6 @@ import UndoHost from "@/components/UndoHost";
 const sections: Array<{ path: string; label: string }> = [
   { path: "/dashboard", label: "Dashboard" },
   { path: "/ledger", label: "Ledger" },
-  { path: "/budgets", label: "Budgets & Categories" },
-  { path: "/bills", label: "Recurring Transactions" },
   { path: "/forecast", label: "Forecast" },
   { path: "/goals", label: "Goals" },
   { path: "/settings", label: "Settings" },
@@ -58,12 +54,13 @@ export default function App() {
           <Route path="/" element={<Navigate to="/dashboard" replace />} />
           <Route path="/dashboard" element={<Dashboard />} />
           <Route path="/ledger" element={<Ledger />} />
-          {/* The per-account tabs folded into the unified Ledger in v1.4. */}
+          {/* v1.4 folded the account tabs into the Ledger; v1.6 folded
+              Budgets & Categories and Recurring Transactions in too. */}
           <Route path="/bank-account" element={<Navigate to="/ledger" replace />} />
           <Route path="/credit-card" element={<Navigate to="/ledger" replace />} />
           <Route path="/savings" element={<Navigate to="/ledger" replace />} />
-          <Route path="/budgets" element={<Budgets />} />
-          <Route path="/bills" element={<Bills />} />
+          <Route path="/budgets" element={<Navigate to="/ledger" replace />} />
+          <Route path="/bills" element={<Navigate to="/ledger" replace />} />
           <Route path="/forecast" element={<Forecast />} />
           <Route path="/goals" element={<Goals />} />
           <Route path="/settings" element={<Settings />} />
