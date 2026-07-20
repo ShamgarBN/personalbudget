@@ -80,7 +80,22 @@ pub fn generate(
             end: bounded_end.format("%Y-%m-%d").to_string(),
             label: format!("{} \u{2014} {}", start.format("%b %-d"), (bounded_end - Duration::days(1)).format("%b %-d, %Y")),
         });
+        // Progress guard: a degenerate schedule (e.g. duplicate custom dates)
+        // could yield a period that doesn't advance the cursor. Fail loudly
+        // instead of looping forever and eating all memory.
+        if bounded_end <= cursor {
+            return Err(AppError::Invalid(format!(
+                "pay-period schedule failed to advance past {cursor} — check the schedule configuration"
+            )));
+        }
         cursor = bounded_end;
+        // Belt-and-suspenders: no sane request produces this many periods
+        // (100 years of weekly ≈ 5,200). Bail out rather than balloon.
+        if out.len() > 20_000 {
+            return Err(AppError::Invalid(
+                "pay-period generation exceeded 20,000 periods — refusing to continue".into(),
+            ));
+        }
     }
     Ok(out)
 }
@@ -157,10 +172,13 @@ fn fixed_step_period(s: &PayPeriodSchedule, date: NaiveDate, step_days: i64) -> 
         .ok_or_else(|| AppError::Invalid("weekly/biweekly requires anchor_date".into()))?;
     let anchor = NaiveDate::parse_from_str(anchor_str, "%Y-%m-%d")?;
     let diff = (date - anchor).num_days();
-    let mut k = diff.div_euclid(step_days);
-    if diff.rem_euclid(step_days) == 0 && diff < 0 {
-        k -= 1;
-    }
+    // div_euclid floors toward -inf, so this k is correct for dates before the
+    // anchor too — anchor + k*step <= date < anchor + (k+1)*step always holds.
+    // (A former `k -= 1` "adjustment" for negative on-boundary dates returned
+    // the PREVIOUS period — [start, end) with end == date — which made
+    // `generate`'s cursor stop advancing: an infinite loop that ate all memory
+    // whenever a request range crossed a pre-anchor step boundary.)
+    let k = diff.div_euclid(step_days);
     let start = anchor + Duration::days(k * step_days);
     let end = start + Duration::days(step_days);
     Ok((start, end))
@@ -315,5 +333,72 @@ mod tests {
             }
         }
         assert!(saw_boundary, "schedule boundary at 2027-01-01 should split a period");
+    }
+}
+
+#[cfg(test)]
+mod fixed_step_boundary {
+    use super::*;
+    use crate::models::PayPeriodSchedule;
+
+    fn biweekly(effective_from: &str, effective_to: Option<&str>, anchor: &str) -> PayPeriodSchedule {
+        PayPeriodSchedule {
+            id: 0,
+            effective_from: effective_from.into(),
+            effective_to: effective_to.map(|s| s.to_string()),
+            cadence_kind: "biweekly".into(),
+            anchor_date: Some(anchor.into()),
+            day_of_month_1: None,
+            day_of_month_2: None,
+            day_of_month: None,
+            custom_dates_json: None,
+        }
+    }
+
+    /// Regression: dates exactly N steps BEFORE the anchor must fall in the
+    /// period that STARTS on them, not the one that ends on them. The old
+    /// `k -= 1` adjustment violated this and made generate() loop forever.
+    #[test]
+    fn on_boundary_before_anchor_is_period_start() {
+        let s = biweekly("2025-12-01", None, "2026-01-02");
+        for days_before in [14i64, 28, 42] {
+            let d = NaiveDate::from_ymd_opt(2026, 1, 2).unwrap() - Duration::days(days_before);
+            let (start, end) = period_containing(&s, d).unwrap();
+            assert_eq!(start, d, "period must start on {d}");
+            assert_eq!(end, d + Duration::days(14));
+        }
+    }
+
+    /// Regression: the exact configuration + request that bricked v1.5.1 —
+    /// Dashboard's 3-years-back window over a biweekly schedule whose anchor
+    /// sits after its effective_from. Must terminate.
+    #[test]
+    fn dashboard_window_over_late_anchor_terminates() {
+        let schedules = vec![
+            biweekly("2025-12-01", Some("2026-06-30"), "2026-01-02"),
+            PayPeriodSchedule {
+                id: 1,
+                effective_from: "2026-06-15".into(),
+                effective_to: None,
+                cadence_kind: "semimonthly".into(),
+                anchor_date: None,
+                day_of_month_1: Some(1),
+                day_of_month_2: Some(15),
+                day_of_month: None,
+                custom_dates_json: None,
+            },
+        ];
+        let periods = generate(
+            &schedules,
+            NaiveDate::from_ymd_opt(2023, 7, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 10, 31).unwrap(),
+        )
+        .expect("must not loop or error");
+        assert!(!periods.is_empty());
+        // First emitted period starts at the schedule walk-in, and every
+        // period strictly advances.
+        for w in periods.windows(2) {
+            assert!(w[1].start >= w[0].end || w[1].start > w[0].start);
+        }
     }
 }
