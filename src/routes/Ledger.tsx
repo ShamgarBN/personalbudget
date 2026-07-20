@@ -435,16 +435,32 @@ export default function Ledger() {
   }, [filteredRows, ghosts, bankAccount]);
 
   // ---- Credit Card Payoff ----
-  // Only ACTUAL charges (dated today or earlier) appear in the accordion —
-  // future-dated card rows are plans, not debt. The payoff amount is likewise
-  // the card's balance as of today, not inflated by future rows.
-  const ccCharges = useMemo(
-    () =>
-      rows.filter(
-        (r) => r.account_id === creditAccount?.id && r.amount < 0 && r.date <= todayIso,
-      ),
-    [rows, creditAccount, todayIso],
-  );
+  // The accordion lists only the charges still making up the balance owed:
+  // actual (dated today or earlier), and not yet covered by payments. FIFO —
+  // payments pay off the oldest charges first, so once a payment posts, the
+  // charges it covered drop out of the list. (Computed over the visible
+  // range; the default All-time view sees the full history and is exact.)
+  const ccCharges = useMemo(() => {
+    if (!creditAccount) return [];
+    const actual = rows.filter(
+      (r) => r.account_id === creditAccount.id && r.date <= todayIso,
+    ); // rows are ASC by date
+    // Pool of money that has gone toward the card: payments/credits, less any
+    // pre-history debt in the opening balance (it gets paid off first).
+    let pool =
+      actual.filter((r) => r.amount > 0).reduce((s, r) => s + r.amount, 0) +
+      Math.min(0, creditAccount.opening_balance);
+    const unpaid: Transaction[] = [];
+    for (const c of actual) {
+      if (c.amount >= 0) continue;
+      if (pool >= -c.amount - 0.005) {
+        pool += c.amount; // fully covered by payments — paid off
+      } else {
+        unpaid.push(c);
+      }
+    }
+    return unpaid;
+  }, [rows, creditAccount, todayIso]);
   const ccBalanceAsOf = useQuery({
     queryKey: ["cc-balance-as-of", creditAccount?.id, todayIso],
     queryFn: () => api.accountBalanceAsOf(creditAccount!.id, todayIso),
@@ -1095,6 +1111,7 @@ export default function Ledger() {
                                       : new Set(ccCharges.map((c) => c.id)),
                                   )
                                 }
+                                onEdit={editField}
                                 onDeleteOne={deleteOne}
                                 onBulkDelete={ccBulkDelete}
                               />
@@ -1147,6 +1164,7 @@ export default function Ledger() {
                   s.size === ccCharges.length ? new Set() : new Set(ccCharges.map((c) => c.id)),
                 )
               }
+              onEdit={editField}
               onDeleteOne={deleteOne}
               onBulkDelete={ccBulkDelete}
             />
@@ -1232,10 +1250,10 @@ function YearGroup({
 }
 
 // The Credit Card Payoff group: a header row (the payoff = the card's actual
-// balance as of today) plus, when expanded, this view's actual charges — each
-// deletable, with a select-all + bulk delete control row. Rendered inline
-// beneath the current pay period when grouping is on; falls back to a pinned
-// footer otherwise.
+// balance as of today) plus, when expanded, the UNPAID charges — the ones
+// still making up that balance — each editable and deletable, with select-all
+// + bulk delete. Rendered inline beneath the current pay period when grouping
+// is on; falls back to a pinned footer otherwise.
 function CcPayoffBody({
   variant,
   accountName,
@@ -1247,6 +1265,7 @@ function CcPayoffBody({
   selected,
   onToggleSelect,
   onSelectAll,
+  onEdit,
   onDeleteOne,
   onBulkDelete,
 }: {
@@ -1260,6 +1279,7 @@ function CcPayoffBody({
   selected: Set<number>;
   onToggleSelect: (id: number) => void;
   onSelectAll: () => void;
+  onEdit: RowCtx["onEdit"];
   onDeleteOne: (t: Transaction) => void;
   onBulkDelete: () => void;
 }) {
@@ -1277,7 +1297,7 @@ function CcPayoffBody({
             <span className="inline-block w-3">{expanded ? "▾" : "▸"}</span>
             Credit Card Payoff{" "}
             <span className="text-xs text-amber-700 font-normal normal-case">
-              ({accountName} balance as of today · {charges.length} charge{charges.length === 1 ? "" : "s"} in view)
+              ({accountName} balance as of today · {charges.length} unpaid charge{charges.length === 1 ? "" : "s"})
             </span>
           </button>
         </td>
@@ -1319,7 +1339,9 @@ function CcPayoffBody({
         (charges.length === 0 ? (
           <tr className="bg-amber-50/60">
             <td colSpan={NUM_COLS} className="px-3 py-2 pl-10 text-xs text-amber-800/70 italic">
-              No actual charges on the card in this view.
+              {Math.abs(payoff) < 0.005
+                ? "The card is fully paid off — nothing owed."
+                : "No unpaid charges in this view."}
             </td>
           </tr>
         ) : (
@@ -1333,13 +1355,26 @@ function CcPayoffBody({
                   className="cursor-pointer align-middle"
                 />
               </td>
-              <td className="px-3 py-1 whitespace-nowrap">{fmtDate(c.date)}</td>
-              <td className="px-3 py-1 truncate" colSpan={5}>
-                <span className="line-clamp-1" title={c.description}>
-                  {c.title ?? c.description}
-                </span>
+              <td className="px-3 py-1 whitespace-nowrap">
+                <InlineDate
+                  value={c.date}
+                  onSave={(date) => onEdit(c, "date edit", { date }, { date: c.date })}
+                />
               </td>
-              <td className="px-3 py-1 text-right tabular-nums text-red-700">{fmtUSD(c.amount)}</td>
+              <td className="px-3 py-1 truncate" colSpan={5}>
+                <InlineText
+                  value={c.title ?? c.description}
+                  onSave={(v) =>
+                    onEdit(c, "description edit", { title: v || null }, { title: c.title })
+                  }
+                />
+              </td>
+              <td className="px-3 py-1 text-right tabular-nums text-red-700">
+                <InlineNumber
+                  value={c.amount}
+                  onSave={(amount) => onEdit(c, "amount edit", { amount }, { amount: c.amount })}
+                />
+              </td>
               <td colSpan={2} />
               <td className="px-3 py-1 text-right whitespace-nowrap">
                 <button
@@ -1380,6 +1415,13 @@ function PeriodBody({
 }) {
   const [open, toggle] = useCollapsed(groupKey, defaultOpen);
   const total = rows.reduce((s, r) => s + r.amount, 0);
+  // Bank balance at the end of this pay period (last bank row/ghost in it).
+  let periodRunning: number | null = null;
+  for (const r of rows) {
+    if (r.account_id === ctx.bankAccountId && r.running_balance != null) {
+      periodRunning = r.running_balance;
+    }
+  }
   return (
     <tbody>
       <tr className="bg-gray-50 border-y border-gray-200">
@@ -1396,7 +1438,13 @@ function PeriodBody({
         <td className={`px-3 py-1.5 text-right text-xs font-semibold tabular-nums ${total < 0 ? "text-red-700" : "text-green-700"}`}>
           {fmtUSD(total)}
         </td>
-        <td colSpan={3} />
+        <td
+          className="px-3 py-1.5 text-right text-xs font-semibold tabular-nums text-gray-800"
+          title="Bank balance at the end of this pay period"
+        >
+          {periodRunning != null ? fmtUSD(periodRunning) : ""}
+        </td>
+        <td colSpan={2} />
       </tr>
       {open && rows.map((t) => <LedgerRow key={t.id} t={t} ctx={ctx} />)}
     </tbody>

@@ -3,7 +3,7 @@
 A single-household budgeting desktop app. Tauri 2 (Rust) backend + React/TypeScript frontend + local SQLite. Runs only on Sarah's Mac Mini; distributed as an adhoc-signed `.dmg`. Apple Silicon only.
 
 - **Repo:** https://github.com/ShamgarBN/personalbudget (branch `main`)
-- **Current version:** 1.5.0 (see `git tag` / GitHub Releases for history + per-release notes)
+- **Current version:** 1.5.1 (see `git tag` / GitHub Releases for history + per-release notes)
 - **Live DB:** `~/Library/Application Support/com.niemann.familybudget/budget.sqlite3` (SQLite, WAL). Never place the live DB in iCloud (WAL/SHM sync hazard). Backups are atomic `VACUUM INTO` snapshots.
 
 ## Build, verify, ship
@@ -53,8 +53,8 @@ One page for everything, modeled on Sarah's spreadsheet (bank + credit interleav
 - **Recurring ghosts project for bank AND credit** accounts (savings never). Only bank ghosts move the Running; credit ghosts show blank Running. Budget ghosts stay bank-only.
 - **Future-dated real rows** render gray+italic (like unreviewed), count under the "Needs review only" filter, and `txnSource(t, today)` never reports a future row as "Imported CSV" (impossible — banks export the past); it falls back to Manual unless overridden.
 - **Amount cell color** = `txn.amount_color` override ?? category color ?? red/green. Hover the cell for the color-dot picker + reset (undoable).
-- **Credit Card Payoff** renders inline directly beneath the current pay period's group (falls back to a pinned footer when grouping is off or no current period is in view). Payoff = `account_balance_as_of(credit, today)` — actual balance, not inflated by future rows. The accordion lists only actual (≤ today) charges, each deletable, with select-all + bulk delete. All undoable.
-- **Year headers** show the year-end bank running balance to the right of the year total.
+- **Credit Card Payoff** renders inline directly beneath the current pay period's group (falls back to a pinned footer when grouping is off or no current period is in view). Payoff = `account_balance_as_of(credit, today)` — actual balance, not inflated by future rows. The accordion lists only UNPAID charges (v1.5.1): FIFO — payments (plus any negative opening balance first) cover the oldest charges; fully covered charges drop out, a partially covered charge still shows whole. Each row is inline-editable (date/description/amount) and deletable, with select-all + bulk delete. All undoable. Computed over the visible range, so exact in the default All-time view.
+- **Year AND pay-period headers** show the end-of-span bank running balance to the right of the group total (v1.5.1 added the period headers).
 - **Expand all / Collapse all** buttons bulk-set every year+period group (`useCollapseStore.setMany`).
 
 ## Domain concepts / conventions
