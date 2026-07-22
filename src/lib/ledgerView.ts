@@ -6,7 +6,8 @@ import { persist } from "zustand/middleware";
 // Group open/closed state persists separately in `collapse.ts`.
 export type RangeMode =
   | { kind: "all" }
-  | { kind: "month"; year: number; month: number /* 1-12 */ }
+  /// All time, grouped by calendar month (every month listed).
+  | { kind: "month" }
   | { kind: "year"; year: number }
   | { kind: "custom"; from: string; to: string };
 

@@ -69,10 +69,8 @@ function rangeBounds(mode: RangeMode): { from: string; to: string; label: string
     return { from: "1900-01-01", to: "2999-12-31", label: "All time" };
   }
   if (mode.kind === "month") {
-    const start = new Date(mode.year, mode.month - 1, 1);
-    const end = new Date(mode.year, mode.month, 0); // last day of month
-    const label = start.toLocaleDateString("en-US", { month: "long", year: "numeric" });
-    return { from: iso(start), to: iso(end), label };
+    // Every month, all time — the grouping switches to calendar months.
+    return { from: "1900-01-01", to: "2999-12-31", label: "All months" };
   }
   if (mode.kind === "year") {
     return {
@@ -232,7 +230,7 @@ export default function Ledger() {
   // periods[0] is the period containing today.
   const budgetPeriods = useQuery({
     queryKey: ["pay-periods", "budget-proj", todayISO()],
-    queryFn: () => api.generatePayPeriods(todayISO(), addDaysISO(todayISO(), 730)),
+    queryFn: () => api.generatePayPeriods(todayISO(), addDaysISO(todayISO(), 1825)),
     retry: false,
   });
   const currentBudgetPeriod = budgetPeriods.data?.[0] ?? null;
@@ -275,7 +273,7 @@ export default function Ledger() {
     if (!showGhosts) return [];
     const t = todayISO();
     const afterToday = addDaysISO(t, 1);
-    const horizon = addDaysISO(t, 730); // 2-year forecast
+    const horizon = addDaysISO(t, 1825); // 5-year forecast — future years stay populated
 
     type Proj = {
       date: string;
@@ -398,6 +396,7 @@ export default function Ledger() {
         import_batch_id: null,
         source_override: null,
         amount_color: null,
+        cc_payment_id: null,
         running_balance: null,
         ghostBillId: pj.billId,
         ghostKey: pj.key,
@@ -435,6 +434,22 @@ export default function Ledger() {
       unpaid: [] as Transaction[],
     };
     if (!creditAccount) return empty;
+    // Explicit assignments (drag & drop / Quick Add / Move-to) win outright:
+    // a charge with cc_payment_id joins that payment's dropdown regardless of
+    // dates; -1 holds it for the payoff. Everything else is FIFO, with each
+    // payment's pool reduced by the explicitly-assigned total.
+    const explicitByPayment = new Map<number, Transaction[]>();
+    const heldForPayoff: Transaction[] = [];
+    for (const r of rows) {
+      if (r.account_id !== creditAccount.id || r.amount >= 0) continue;
+      if (r.cc_payment_id != null && r.cc_payment_id > 0) {
+        const arr = explicitByPayment.get(r.cc_payment_id) ?? [];
+        arr.push(r);
+        explicitByPayment.set(r.cc_payment_id, arr);
+      } else if (r.cc_payment_id === -1) {
+        heldForPayoff.push(r);
+      }
+    }
     const walk = (subset: Transaction[]) => {
       const covered = new Map<number, Transaction[]>(); // payment id -> charges it paid off
       const payments: Transaction[] = [];
@@ -446,10 +461,15 @@ export default function Ledger() {
       for (const r of subset) {
         if (r.account_id !== creditAccount.id) continue;
         if (r.amount < 0) {
+          if (r.cc_payment_id != null) continue; // explicitly placed elsewhere
           queue.push({ t: r, remaining: -r.amount });
         } else if (r.amount > 0) {
           payments.push(r);
-          let pool = r.amount;
+          const explicitSum = (explicitByPayment.get(r.id) ?? []).reduce(
+            (s, c) => s - c.amount,
+            0,
+          );
+          let pool = Math.max(0, r.amount - explicitSum);
           const got: Transaction[] = [];
           while (pool > 0.005 && queue.length > 0) {
             const head = queue[0];
@@ -466,15 +486,22 @@ export default function Ledger() {
       }
       return { covered, payments, queue };
     };
-    // Full-timeline walk: powers every payment's dropdown, including PLANNED
-    // future payments (their dropdown shows the charges they'll cover).
+    // One walk over the full timeline: every payment's dropdown — including
+    // PLANNED future payments — claims its charges, and each charge lives in
+    // exactly ONE dropdown. The payoff lists only actual charges that no
+    // dropdown (past or planned) has claimed; the payoff AMOUNT is still the
+    // true balance as of today (computed independently from the account).
     const full = walk(rows);
-    // As-of-today walk: the projected payoff must only credit payments that
-    // have actually happened — future planned payments don't reduce it.
-    const actual = walk(rows.filter((r) => r.date <= todayIso));
-    const unpaid = actual.queue
-      .map((q) => q.t)
-      .filter((t): t is Transaction => t != null);
+    // Merge explicit members in front of the FIFO-attributed ones.
+    for (const [pid, list] of explicitByPayment) {
+      full.covered.set(pid, [...list, ...(full.covered.get(pid) ?? [])]);
+    }
+    const unpaid = [
+      ...heldForPayoff.filter((t) => t.date <= todayIso),
+      ...full.queue
+        .map((q) => q.t)
+        .filter((t): t is Transaction => t != null && t.date <= todayIso),
+    ].sort((a, b) => a.date.localeCompare(b.date) || a.id - b.id);
     return { covered: full.covered, payments: full.payments, unpaid };
   }, [rows, creditAccount, todayIso]);
   const ccCharges = ccModel.unpaid;
@@ -485,8 +512,15 @@ export default function Ledger() {
   // carries the ledger and the card charges nest under it. Credit GHOSTS
   // (planned recurring card charges) stay visible inline. Filtering to the
   // Credit Card account, searching, or needs-review shows raw card rows.
+  // Also active for the Credit Card account view (v1.7): choosing the card in
+  // the account filter shows the SAME payment dropdowns with every card
+  // transaction nested inside, instead of raw rows.
   const spreadsheetMode =
-    groupByPP && accountFilter === "all" && !search && !needsReviewOnly;
+    groupByPP &&
+    !search &&
+    !needsReviewOnly &&
+    (accountFilter === "all" ||
+      (creditAccount != null && accountFilter === creditAccount.id));
 
   // Real rows + ghosts, in stable display order: by date, real before ghost on
   // the same day, then real rows by id and ghosts by their projection sequence.
@@ -494,10 +528,18 @@ export default function Ledger() {
   // rows keep their authoritative backend running, ghosts continue from the
   // bank row above them, and credit rows are carried along without moving it.
   const { items, endBankRunning } = useMemo(() => {
-    // In spreadsheet mode real card rows render inside the per-period Credit
-    // Card Payment dropdowns, not the main flow.
+    // In spreadsheet mode actual card activity renders inside the per-period
+    // Credit Card Payment dropdowns, not the main flow. FUTURE-dated charges
+    // (Sarah's planned card spending) stay inline as muted rows until their
+    // date passes; payments of any date live only as dropdowns.
     const flowRows = spreadsheetMode
-      ? filteredRows.filter((r) => r.account_id !== creditAccount?.id)
+      ? filteredRows.filter(
+          (r) =>
+            !(
+              r.account_id === creditAccount?.id &&
+              (r.amount > 0 || r.date <= todayIso)
+            ),
+        )
       : filteredRows;
     const merged: LedgerItem[] = [...flowRows.map((r) => ({ ...r })), ...ghosts];
     merged.sort((a, b) => {
@@ -678,13 +720,39 @@ export default function Ledger() {
   const payPeriods = useQuery({
     queryKey: ["pay-periods", "unified-ledger", ppRange?.from, ppRange?.to],
     queryFn: () => api.generatePayPeriods(ppRange!.from, ppRange!.to),
-    enabled: !!ppRange,
+    enabled: !!ppRange && mode.kind !== "month",
   });
 
+  const monthMode = mode.kind === "month";
   const groupedPP = useMemo(() => {
-    if (!groupByPP || !payPeriods.data) return null;
-    const buckets: Array<{ period: PayPeriod; rows: LedgerItem[] }> =
-      payPeriods.data.map((p) => ({ period: p, rows: [] as LedgerItem[] }));
+    if (!groupByPP) return null;
+    let base: PayPeriod[];
+    if (monthMode) {
+      // Monthly view: one bucket per calendar month that has anything in it
+      // (rows, card payments, or today), all months listed.
+      const months = new Set<string>();
+      for (const r of items) months.add(r.date.slice(0, 7));
+      if (spreadsheetMode) for (const p of ccModel.payments) months.add(p.date.slice(0, 7));
+      months.add(todayIso.slice(0, 7));
+      base = [...months].sort().map((m) => {
+        const [y, mo] = m.split("-").map(Number);
+        return {
+          start: `${m}-01`,
+          end: iso(new Date(y, mo, 1)),
+          label: new Date(y, mo - 1, 1).toLocaleDateString("en-US", {
+            month: "long",
+            year: "numeric",
+          }),
+        };
+      });
+    } else {
+      if (!payPeriods.data) return null;
+      base = payPeriods.data;
+    }
+    const buckets: Array<{ period: PayPeriod; rows: LedgerItem[] }> = base.map((p) => ({
+      period: p,
+      rows: [] as LedgerItem[],
+    }));
     const orphans: LedgerItem[] = [];
     // Both items and buckets are sorted ASC by date — single pass with a
     // moving pointer avoids O(items × periods). PayPeriod.end is exclusive.
@@ -697,8 +765,15 @@ export default function Ledger() {
         orphans.push(r);
       }
     }
-    return { buckets: buckets.filter((b) => b.rows.length > 0), orphans };
-  }, [groupByPP, payPeriods.data, items]);
+    // A period whose only content is a card payment must still render (its
+    // dropdown lives there) even though payments aren't flow rows.
+    const hasPayment = (p: PayPeriod) =>
+      spreadsheetMode && ccModel.payments.some((c) => p.start <= c.date && c.date < p.end);
+    return {
+      buckets: buckets.filter((b) => b.rows.length > 0 || hasPayment(b.period)),
+      orphans,
+    };
+  }, [groupByPP, monthMode, payPeriods.data, items, spreadsheetMode, ccModel, todayIso]);
 
   // The pay-period bucket containing today — the payoff row renders right
   // beneath it, and it's the one group open by default.
@@ -742,11 +817,12 @@ export default function Ledger() {
   // Expand all / Collapse all: bulk-set every year + pay-period group key.
   const setManyCollapsed = useCollapseStore((s) => s.setMany);
   const setAllGroups = (open: boolean) => {
-    const entries: Record<string, boolean> = { "ledger:pp:orphans": open };
+    const prefix = monthMode ? "ledger:month:" : "ledger:pp:";
+    const entries: Record<string, boolean> = { [`${prefix}orphans`]: open };
     if (groupedPP) {
       for (const b of groupedPP.buckets) {
         entries[`ledger:year:${b.period.start.slice(0, 4)}`] = open;
-        entries[`ledger:pp:${b.period.start}`] = open;
+        entries[`${prefix}${b.period.start}`] = open;
       }
     }
     setManyCollapsed(entries);
@@ -761,6 +837,22 @@ export default function Ledger() {
     ccPaymentsIn: (start, end) =>
       ccModel.payments.filter((p) => p.date >= start && p.date < end),
     ccCoveredBy: (paymentId) => ccModel.covered.get(paymentId) ?? [],
+    onAssignCc: (chargeId, target) => {
+      const charge = rows.find((r) => r.id === chargeId);
+      if (!charge) return;
+      const prev = charge.cc_payment_id;
+      pushUndo(`move of "${charge.title ?? charge.description}"`, async () => {
+        await api.updateTransaction({ id: chargeId, ccPaymentId: prev });
+      });
+      update.mutate({ id: chargeId, ccPaymentId: target });
+    },
+    ccMoveTargets: ccModel.payments
+      .slice()
+      .reverse()
+      .map((p) => ({
+        id: p.id,
+        label: `${fmtDate(p.date)} · ${fmtUSD(-p.amount)}`,
+      })),
     onEditRecurring: (billId) => {
       setRecurringEditId(billId);
       setPanel("recurring");
@@ -785,28 +877,18 @@ export default function Ledger() {
         <div className="flex items-center gap-1.5 text-sm flex-wrap">
           <button
             onClick={() => {
-              if (mode.kind === "month") {
-                const d = new Date(mode.year, mode.month - 2, 1);
-                setMode({ kind: "month", year: d.getFullYear(), month: d.getMonth() + 1 });
-              } else if (mode.kind === "year") {
-                setMode({ kind: "year", year: mode.year - 1 });
-              }
+              if (mode.kind === "year") setMode({ kind: "year", year: mode.year - 1 });
             }}
-            disabled={mode.kind === "custom" || mode.kind === "all"}
+            disabled={mode.kind !== "year"}
             className="px-2 py-1 rounded border border-gray-200 bg-white text-gray-800 disabled:opacity-30"
           >
             ←
           </button>
           <button
             onClick={() => {
-              if (mode.kind === "month") {
-                const d = new Date(mode.year, mode.month, 1);
-                setMode({ kind: "month", year: d.getFullYear(), month: d.getMonth() + 1 });
-              } else if (mode.kind === "year") {
-                setMode({ kind: "year", year: mode.year + 1 });
-              }
+              if (mode.kind === "year") setMode({ kind: "year", year: mode.year + 1 });
             }}
-            disabled={mode.kind === "custom" || mode.kind === "all"}
+            disabled={mode.kind !== "year"}
             className="px-2 py-1 rounded border border-gray-200 bg-white text-gray-800 disabled:opacity-30"
           >
             →
@@ -824,8 +906,7 @@ export default function Ledger() {
               key={k}
               onClick={() => {
                 if (k === "all") setMode({ kind: "all" });
-                if (k === "month")
-                  setMode({ kind: "month", year: today.getFullYear(), month: today.getMonth() + 1 });
+                if (k === "month") setMode({ kind: "month" });
                 if (k === "year") setMode({ kind: "year", year: today.getFullYear() });
                 if (k === "custom") setMode({ kind: "custom", from: customFrom, to: customTo });
               }}
@@ -1176,7 +1257,7 @@ export default function Ledger() {
                             <PeriodBody
                               label={bucket.period.label}
                               rows={bucket.rows}
-                              groupKey={`ledger:pp:${bucket.period.start}`}
+                              groupKey={`${monthMode ? "ledger:month:" : "ledger:pp:"}${bucket.period.start}`}
                               ctx={rowCtx}
                               period={bucket.period}
                               defaultOpen={bucket === openBucket}
@@ -1209,6 +1290,8 @@ export default function Ledger() {
                                 onEdit={editField}
                                 onDeleteOne={deleteOne}
                                 onBulkDelete={ccBulkDelete}
+                                onAssignCc={rowCtx.onAssignCc}
+                                ccMoveTargets={rowCtx.ccMoveTargets}
                               />
                             )}
                           </Fragment>
@@ -1220,7 +1303,7 @@ export default function Ledger() {
                     <PeriodBody
                       label={`Outside any pay period (${groupedPP.orphans.length})`}
                       rows={groupedPP.orphans}
-                      groupKey="ledger:pp:orphans"
+                      groupKey={monthMode ? "ledger:month:orphans" : "ledger:pp:orphans"}
                       ctx={rowCtx}
                       defaultOpen={false}
                     />
@@ -1262,6 +1345,8 @@ export default function Ledger() {
               onEdit={editField}
               onDeleteOne={deleteOne}
               onBulkDelete={ccBulkDelete}
+              onAssignCc={rowCtx.onAssignCc}
+              ccMoveTargets={rowCtx.ccMoveTargets}
             />
           )}
         </table>
@@ -1316,6 +1401,11 @@ type RowCtx = {
   spreadsheetMode: boolean;
   ccPaymentsIn: (start: string, end: string) => Transaction[];
   ccCoveredBy: (paymentId: number) => Transaction[];
+  /// Reassign a charge to a payment's dropdown (id), the payoff (-1), or
+  /// back to automatic oldest-first attribution (null). Undoable.
+  onAssignCc: (chargeId: number, target: number | null) => void;
+  /// Move-to options for the charge rows' menu (payments, newest first).
+  ccMoveTargets: Array<{ id: number; label: string }>;
   onEditRecurring: (billId: number) => void;
   onOpenBudgets: () => void;
   selected: Set<number>;
@@ -1401,6 +1491,8 @@ function CcPayoffBody({
   onEdit,
   onDeleteOne,
   onBulkDelete,
+  onAssignCc,
+  ccMoveTargets,
 }: {
   variant: "inline" | "footer";
   accountName: string;
@@ -1415,11 +1507,20 @@ function CcPayoffBody({
   onEdit: RowCtx["onEdit"];
   onDeleteOne: (t: Transaction) => void;
   onBulkDelete: () => void;
+  onAssignCc: RowCtx["onAssignCc"];
+  ccMoveTargets: RowCtx["ccMoveTargets"];
 }) {
   const nSelected = charges.filter((c) => selected.has(c.id)).length;
   const content = (
     <>
-      <tr>
+      <tr
+        onDragOver={(e) => e.preventDefault()}
+        onDrop={(e) => {
+          e.preventDefault();
+          const id = Number(e.dataTransfer.getData("text/plain"));
+          if (id) onAssignCc(id, -1);
+        }}
+      >
         <td className="px-3 py-2 text-amber-900 font-medium" colSpan={7}>
           <button
             type="button"
@@ -1482,8 +1583,8 @@ function CcPayoffBody({
             <CcChargeRow
               key={`ccp-${c.id}`}
               c={c}
-              onEdit={onEdit}
-              onDeleteOne={onDeleteOne}
+              ctx={{ onEdit, onDelete: onDeleteOne, onAssignCc, ccMoveTargets }}
+              currentTarget={-1}
               selectable={{ checked: selected.has(c.id), onToggle: () => onToggleSelect(c.id) }}
             />
           ))
@@ -1599,15 +1700,35 @@ function PeriodBody({
   );
 }
 
-// One credit-card payment rendered as an expandable dropdown: the parent row
-// shows the amount the bank paid; expanding it itemizes the charges that
-// payment covered (FIFO), each editable and deletable in place.
+// One credit-card payment rendered as an expandable dropdown. The header
+// amount is the ACCUMULATED TOTAL of the charges inside it — the true amount
+// the bank pays to clear them (when it differs from the recorded payment
+// transaction, the tooltip says so). Charges can be dragged in from other
+// dropdowns; each is editable and deletable in place.
 function CcPaymentGroup({ payment, ctx }: { payment: Transaction; ctx: RowCtx }) {
   const [open, toggle] = useCollapsed(`ledger:ccpay:${payment.id}`, false);
+  const [dragOver, setDragOver] = useState(false);
   const charges = ctx.ccCoveredBy(payment.id);
+  const contentTotal = charges.reduce((s, c) => s + c.amount, 0); // negative
+  const differs = Math.abs(-contentTotal - payment.amount) > 0.01;
   return (
     <>
-      <tr className="bg-amber-50 border-y border-amber-200 text-amber-900">
+      <tr
+        className={`border-y text-amber-900 ${
+          dragOver ? "bg-amber-200 border-amber-400" : "bg-amber-50 border-amber-200"
+        }`}
+        onDragOver={(e) => {
+          e.preventDefault();
+          setDragOver(true);
+        }}
+        onDragLeave={() => setDragOver(false)}
+        onDrop={(e) => {
+          e.preventDefault();
+          setDragOver(false);
+          const id = Number(e.dataTransfer.getData("text/plain"));
+          if (id) ctx.onAssignCc(id, payment.id);
+        }}
+      >
         <td className="px-3 py-1.5" />
         <td className="px-3 py-1.5 whitespace-nowrap">
           <InlineDate
@@ -1621,12 +1742,20 @@ function CcPaymentGroup({ payment, ctx }: { payment: Transaction; ctx: RowCtx })
             <span className="inline-block w-3">{open ? "▾" : "▸"}</span>
             Credit Card Payment
             <span className="text-xs text-amber-700 font-normal">
-              — {payment.title ?? payment.description} · pays {charges.length} charge{charges.length === 1 ? "" : "s"}
+              — {payment.title ?? payment.description} · {charges.length} charge{charges.length === 1 ? "" : "s"}
             </span>
           </button>
         </td>
-        <td className="px-3 py-1.5 text-right tabular-nums font-semibold text-red-700">
-          {fmtUSD(-payment.amount)}
+        <td
+          className="px-3 py-1.5 text-right tabular-nums font-semibold text-red-700"
+          title={
+            differs
+              ? `Charges inside total ${fmtUSD(contentTotal)}; the recorded payment was ${fmtUSD(-payment.amount)}`
+              : `Recorded payment: ${fmtUSD(-payment.amount)}`
+          }
+        >
+          {fmtUSD(contentTotal)}
+          {differs && <span className="ml-1 text-[10px] align-middle text-amber-700">≠</span>}
         </td>
         <td className="px-3 py-1.5" />
         <td className="px-3 py-1.5" />
@@ -1644,12 +1773,12 @@ function CcPaymentGroup({ payment, ctx }: { payment: Transaction; ctx: RowCtx })
         (charges.length === 0 ? (
           <tr className="bg-amber-50/50 text-xs text-amber-800/70">
             <td colSpan={NUM_COLS} className="px-3 py-1.5 pl-12 italic">
-              No charges attributed to this payment (it covered older balance).
+              No charges in this dropdown — drag some here, or it covered older balance.
             </td>
           </tr>
         ) : (
           charges.map((c) => (
-            <CcChargeRow key={`ccc-${c.id}`} c={c} onEdit={ctx.onEdit} onDeleteOne={ctx.onDelete} />
+            <CcChargeRow key={`ccc-${c.id}`} c={c} ctx={ctx} currentTarget={payment.id} />
           ))
         ))}
     </>
@@ -1657,20 +1786,30 @@ function CcPaymentGroup({ payment, ctx }: { payment: Transaction; ctx: RowCtx })
 }
 
 // A single card charge inside a payment/payoff dropdown: inline-editable
-// date/description/amount, optional multi-select checkbox, delete.
+// date/description/amount, draggable between dropdowns (plus a Move menu),
+// optional multi-select checkbox, delete.
 function CcChargeRow({
   c,
-  onEdit,
-  onDeleteOne,
+  ctx,
+  currentTarget,
   selectable,
 }: {
   c: Transaction;
-  onEdit: RowCtx["onEdit"];
-  onDeleteOne: (t: Transaction) => void;
+  ctx: Pick<RowCtx, "onEdit" | "onDelete" | "onAssignCc" | "ccMoveTargets">;
+  /// The dropdown this row currently sits in: a payment id, or -1 for payoff.
+  currentTarget: number;
   selectable?: { checked: boolean; onToggle: () => void };
 }) {
   return (
-    <tr className="bg-amber-50/50 text-xs text-amber-900/80">
+    <tr
+      className="bg-amber-50/50 text-xs text-amber-900/80 cursor-grab active:cursor-grabbing"
+      draggable
+      onDragStart={(e) => {
+        e.dataTransfer.setData("text/plain", String(c.id));
+        e.dataTransfer.effectAllowed = "move";
+      }}
+      title="Drag onto another Credit Card Payment (or the Payoff) to move this charge"
+    >
       <td className="px-3 py-1 text-center">
         {selectable && (
           <input
@@ -1682,24 +1821,46 @@ function CcChargeRow({
         )}
       </td>
       <td className="px-3 py-1 whitespace-nowrap">
-        <InlineDate value={c.date} onSave={(date) => onEdit(c, "date edit", { date }, { date: c.date })} />
+        <InlineDate value={c.date} onSave={(date) => ctx.onEdit(c, "date edit", { date }, { date: c.date })} />
       </td>
       <td className="px-3 py-1 truncate" colSpan={5}>
         <InlineText
           value={c.title ?? c.description}
-          onSave={(v) => onEdit(c, "description edit", { title: v || null }, { title: c.title })}
+          onSave={(v) => ctx.onEdit(c, "description edit", { title: v || null }, { title: c.title })}
         />
       </td>
       <td className="px-3 py-1 text-right tabular-nums text-red-700">
         <InlineNumber
           value={c.amount}
-          onSave={(amount) => onEdit(c, "amount edit", { amount }, { amount: c.amount })}
+          onSave={(amount) => ctx.onEdit(c, "amount edit", { amount }, { amount: c.amount })}
         />
       </td>
-      <td colSpan={2} />
+      <td colSpan={2} className="px-1 py-1 text-right">
+        <select
+          className="border border-amber-200 rounded px-1 py-0.5 text-[10px] bg-white text-amber-900 max-w-full"
+          value=""
+          onChange={(e) => {
+            const v = e.target.value;
+            if (!v) return;
+            ctx.onAssignCc(c.id, v === "auto" ? null : Number(v));
+          }}
+          title="Move this charge to a different dropdown"
+        >
+          <option value="">Move to…</option>
+          <option value="-1">Payoff (not yet paid)</option>
+          <option value="auto">Auto (oldest-first)</option>
+          {ctx.ccMoveTargets
+            .filter((t) => t.id !== currentTarget)
+            .map((t) => (
+              <option key={t.id} value={t.id}>
+                Payment {t.label}
+              </option>
+            ))}
+        </select>
+      </td>
       <td className="px-3 py-1 text-right whitespace-nowrap">
         <button
-          onClick={() => onDeleteOne(c)}
+          onClick={() => ctx.onDelete(c)}
           title="Delete this charge (⌘Z to undo)"
           className="text-[11px] text-amber-800/80 hover:text-red-700"
         >

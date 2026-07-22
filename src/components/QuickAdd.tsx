@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "@/api";
 import { asTree } from "@/lib/categories";
-import { todayISO } from "@/lib/formatting";
+import { fmtDate, fmtUSD, todayISO } from "@/lib/formatting";
 
 interface Draft {
   date: string;
@@ -56,8 +56,22 @@ export default function QuickAdd({
   const categoryTree = useMemo(() => asTree(categories.data ?? []), [categories.data]);
 
   const [draft, setDraft] = useState<Draft>(empty());
+  // Credit-card specifics: a Payment starts a new dropdown; a Charge joins
+  // one — Auto (oldest-first), a specific payment's dropdown, or the payoff.
+  const [ccKind, setCcKind] = useState<"charge" | "payment">("charge");
+  const [ccTarget, setCcTarget] = useState<string>("auto");
   const amountRef = useRef<HTMLInputElement>(null);
   const dateRef = useRef<HTMLInputElement>(null);
+
+  const creditAccount = (accounts.data ?? []).find((a) => a.kind === "credit");
+  const isCc = draft.accountId != null && draft.accountId === creditAccount?.id;
+  const ccPayments = useQuery({
+    queryKey: ["transactions", "quickadd-cc-payments", creditAccount?.id],
+    queryFn: () =>
+      api.listTransactions({ account_id: creditAccount!.id, limit: 50000 }),
+    enabled: open && isCc && !!creditAccount,
+    select: (page) => page.rows.filter((r) => r.amount > 0), // DESC (newest first)
+  });
 
   useEffect(() => {
     if (open) {
@@ -75,18 +89,29 @@ export default function QuickAdd({
   const save = useMutation({
     mutationFn: async () => {
       if (!draft.accountId) throw new Error("Pick an account");
-      const amt = parseFloat(draft.amount);
+      let amt = parseFloat(draft.amount);
       if (Number.isNaN(amt)) throw new Error("Bad amount");
+      if (isCc) {
+        // Enforce the sign by kind: charges are negative, payments positive.
+        amt = ccKind === "payment" ? Math.abs(amt) : -Math.abs(amt);
+      }
       const id = await api.createTransaction({
         account_id: draft.accountId,
         date: draft.date,
-        description: draft.description.trim() || "(quick add)",
+        description:
+          draft.description.trim() ||
+          (isCc && ccKind === "payment" ? "Credit Card Payment" : "(quick add)"),
         amount: amt,
         category_id: draft.categoryId,
         memo: draft.memo.trim() ? draft.memo.trim() : null,
         cleared: false,
         flagged: false,
       });
+      // A charge can be placed directly into a chosen dropdown. It never
+      // creates a new dropdown — only payments do that.
+      if (isCc && ccKind === "charge" && ccTarget !== "auto") {
+        await api.updateTransaction({ id, ccPaymentId: Number(ccTarget) });
+      }
       return id;
     },
     onSuccess: (_id, _vars, _ctx) => {
@@ -155,11 +180,51 @@ export default function QuickAdd({
             ref={amountRef}
             type="number"
             step="0.01"
-            placeholder="Amount (negative = outflow)"
+            placeholder={isCc ? "Amount" : "Amount (negative = outflow)"}
             className="col-span-2 border rounded px-2 py-1.5 text-sm bg-white text-right"
             value={draft.amount}
             onChange={(e) => setDraft({ ...draft, amount: e.target.value })}
           />
+          {isCc && (
+            <>
+              <div className="col-span-3 flex rounded-md border border-gray-200 overflow-hidden text-sm">
+                {(
+                  [
+                    ["charge", "Charge"],
+                    ["payment", "Payment (new dropdown)"],
+                  ] as const
+                ).map(([k, lbl]) => (
+                  <button
+                    key={k}
+                    type="button"
+                    onClick={() => setCcKind(k)}
+                    className={`flex-1 px-2 py-1.5 ${
+                      ccKind === k
+                        ? "bg-amber-500 text-white"
+                        : "bg-white text-gray-700 hover:bg-gray-50"
+                    }`}
+                  >
+                    {lbl}
+                  </button>
+                ))}
+              </div>
+              <select
+                className="col-span-3 border rounded px-2 py-1.5 text-sm bg-white disabled:opacity-40"
+                value={ccTarget}
+                disabled={ccKind === "payment"}
+                onChange={(e) => setCcTarget(e.target.value)}
+                title="Which Credit Card Payment dropdown this charge belongs to"
+              >
+                <option value="auto">Pay off: Auto (oldest-first)</option>
+                <option value="-1">Pay off: hold for payoff</option>
+                {(ccPayments.data ?? []).map((p) => (
+                  <option key={p.id} value={p.id}>
+                    Pay off in: {fmtDate(p.date)} · {fmtUSD(-p.amount)}
+                  </option>
+                ))}
+              </select>
+            </>
+          )}
           <select
             className="col-span-3 border rounded px-2 py-1.5 text-sm bg-white"
             value={draft.categoryId ?? ""}

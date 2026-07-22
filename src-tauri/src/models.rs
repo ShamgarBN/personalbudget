@@ -55,6 +55,9 @@ pub struct Transaction {
     pub source_override: Option<String>,
     /// Custom text color for the Amount cell (hex). NULL -> category color.
     pub amount_color: Option<String>,
+    /// Explicit credit-card dropdown membership: NULL = auto (FIFO),
+    /// >0 = assigned to that payment txn, -1 = held for the payoff.
+    pub cc_payment_id: Option<i64>,
     /// Account balance immediately after this transaction posted, computed
     /// over the full history for this account regardless of any active filter.
     /// Null for split children (their amounts roll up under the parent).

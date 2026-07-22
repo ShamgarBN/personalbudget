@@ -40,6 +40,9 @@ export interface Transaction {
   import_batch_id: number | null;
   source_override: TxnSource | null;
   amount_color: string | null;
+  /// Credit-card dropdown membership: null = auto (FIFO), >0 = that payment
+  /// transaction's id, -1 = held for the projected payoff.
+  cc_payment_id: number | null;
   running_balance: number | null;
 }
 

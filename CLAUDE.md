@@ -3,7 +3,7 @@
 A single-household budgeting desktop app. Tauri 2 (Rust) backend + React/TypeScript frontend + local SQLite. Runs only on Sarah's Mac Mini; distributed as an adhoc-signed `.dmg`. Apple Silicon only.
 
 - **Repo:** https://github.com/ShamgarBN/personalbudget (branch `main`)
-- **Current version:** 1.6.0 (see `git tag` / GitHub Releases for history + per-release notes)
+- **Current version:** 1.7.0 (see `git tag` / GitHub Releases for history + per-release notes)
 - **Live DB:** `~/Library/Application Support/com.niemann.familybudget/budget.sqlite3` (SQLite, WAL). Never place the live DB in iCloud (WAL/SHM sync hazard). Backups are atomic `VACUUM INTO` snapshots.
 
 ## Build, verify, ship
@@ -32,7 +32,7 @@ Frontend (`src/`):
 
 Backend (`src-tauri/src/`):
 - `commands/` — grouped by feature (`transactions`, `accounts`, `categories`, `budgets`, `bills`, `goals`, `pay_periods`, `dashboard`, `imp`, `legacy_import`, `forecast_cmd`, `backup`, `export`). Register new commands in `lib.rs`.
-- `pay_period.rs` — cadence math (has unit tests). `forecast.rs` — projection engine. `parsers/` — per-bank CSV adapters (BoA checking, Apple Card, Capital One savings) + legacy-app importer. `migrations/` — refinery, `V1`..`V10` (V9 = `txn.source_override`, V10 = `txn.amount_color`).
+- `pay_period.rs` — cadence math (has unit tests). `forecast.rs` — projection engine. `parsers/` — per-bank CSV adapters (BoA checking, Apple Card, Capital One savings) + legacy-app importer. `migrations/` — refinery, `V1`..`V11` (V9 = `txn.source_override`, V10 = `txn.amount_color`, V11 = `txn.cc_payment_id`).
 
 ## The unified Ledger (v1.4)
 
@@ -67,6 +67,17 @@ One page for everything, modeled on Sarah's spreadsheet (bank + credit interleav
 - **SOON block**: each period's budget ghosts cluster into a collapsible "Soon — remaining budgets" subsection with an *edit budgets* link; every period's amounts are allocation − categorized spend **in that period** (her future-planned rows make future periods live too).
 - **Modals on the Ledger**: Budgets & Categories and Recurring panels open from toolbar buttons; recurring ghost rows have **Edit…** that opens the recurring editor prefilled (`RecurringPanel initialEditBillId`).
 - Nav is just Dashboard / Ledger / Forecast / Goals / Settings + the global Quick Add.
+
+## v1.7 — cc dropdowns become first-class (Sarah-controlled)
+
+- **`txn.cc_payment_id`** (V11, app-managed, no FK): NULL = auto FIFO, >0 = explicitly assigned to that payment txn's dropdown, -1 = held for the payoff. Explicit wins over FIFO; each payment's FIFO pool is reduced by its explicit members' total.
+- **A charge lives in exactly ONE dropdown**: explicit assignment > the payment (past OR planned-future) whose FIFO claims it > the payoff (unclaimed, dated ≤ today). Payoff AMOUNT stays balance-as-of-today regardless.
+- **Dropdown headers total their contents** (sum of charges inside = what the bank pays), with an `≠` marker + tooltip when that differs from the recorded payment amount.
+- **Drag & drop** a charge row onto any payment header or the payoff header to move it; every charge row also has a "Move to…" menu (payoff / auto / any payment). Undoable.
+- **Credit Card account view** shows the same per-period dropdowns with all card txns nested (raw rows via search/needs-review). Future-dated charges stay inline (muted) until their date passes.
+- **Quick Add** with the Credit Card account: Charge vs "Payment (new dropdown)" toggle; charges pick their dropdown (Auto / hold for payoff / specific payment) and never create dropdowns.
+- **Monthly view = all months** (calendar-month buckets under year groups, every month listed; arrows now only serve Yearly mode). Collapse keys: `ledger:month:<start>` vs `ledger:pp:<start>`.
+- **Ghost horizon is 5 years** (was 2) so recurring/budget projections populate future years.
 
 ## Domain concepts / conventions
 
